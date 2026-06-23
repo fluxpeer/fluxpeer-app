@@ -1,0 +1,11 @@
+build/
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+android/.gradle/
+android/app/src/main/jniLibs/
+ios/Pods/
+**/Frameworks/
+**/*.so
+.DS_Store
