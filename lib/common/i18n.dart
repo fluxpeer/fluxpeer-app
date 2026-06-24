@@ -165,7 +165,7 @@ const _zh = {
   'me.shareBackup': '分享备份文件',
   'me.importHint': '粘贴从其他设备导出的备份(JSON)。',
   'settings.identity': '网络身份',
-  // 保活 / 权限
+  // keep-alive / permissions
   'me.permissions': '权限设置',
   'me.keepalive': '保活与权限',
   'perm.vpn': 'VPN 授权',

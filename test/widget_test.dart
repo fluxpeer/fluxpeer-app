@@ -1,30 +1,34 @@
-// This is a basic Flutter widget test.
-//
-// To perform an interaction with a widget in your test, use the WidgetTester
-// utility in the flutter_test package. For example, you can send tap and scroll
-// gestures. You can also use WidgetTester to find child widgets in the widget
-// tree, read text, and verify that the values of widget properties are correct.
-
-import 'package:flutter/material.dart';
+// SPDX-License-Identifier: AGPL-3.0-or-later
 import 'package:flutter_test/flutter_test.dart';
-
-import 'package:fluxpeer/main.dart';
+import 'package:fluxpeer/models/models.dart';
 
 void main() {
-  testWidgets('Counter increments smoke test', (WidgetTester tester) async {
-    // Build our app and trigger a frame.
-    await tester.pumpWidget(const MyApp());
+  test('network settings round-trip through json', () {
+    const network = FxNetwork(
+      id: 'net-1',
+      name: 'home',
+      controlUrl: 'https://ctrl.example',
+      overlayV4: '100.72.16.5',
+      deviceId: 'dev-1',
+      pubkey: 'pk-1',
+      dns: ['1.1.1.1'],
+      exitNode: true,
+      excludeRoutes: ['192.168.0.0/16'],
+      transportProtocol: 'anytls',
+    );
 
-    // Verify that our counter starts at 0.
-    expect(find.text('0'), findsOneWidget);
-    expect(find.text('1'), findsNothing);
+    final roundTrip = FxNetwork.fromJson(network.toJson());
 
-    // Tap the '+' icon and trigger a frame.
-    await tester.tap(find.byIcon(Icons.add));
-    await tester.pump();
-
-    // Verify that our counter has incremented.
-    expect(find.text('0'), findsNothing);
-    expect(find.text('1'), findsOneWidget);
+    expect(roundTrip.id, network.id);
+    expect(roundTrip.name, network.name);
+    expect(roundTrip.controlUrl, network.controlUrl);
+    expect(roundTrip.overlayV4, network.overlayV4);
+    expect(roundTrip.deviceId, network.deviceId);
+    expect(roundTrip.pubkey, network.pubkey);
+    expect(roundTrip.dns, network.dns);
+    expect(roundTrip.exitNode, isTrue);
+    expect(roundTrip.excludeRoutes, network.excludeRoutes);
+    expect(roundTrip.transportProtocol, 'anytls');
+    expect(network.toJson()['user_transport'], 'anytls');
   });
 }

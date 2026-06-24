@@ -64,7 +64,9 @@ final class FluxpeerPlugin: NSObject, FlutterStreamHandler {
                 let kp = try FluxpeerNative.unwrap(FluxpeerNative.generateKeypair()) as? [String: Any] ?? [:]
                 let pub = kp["public_key"] as? String ?? ""
                 let priv = kp["private_key"] as? String ?? ""
-                let enrollReq = self.json(["token": token, "name": device, "wg_public_key": pub])
+                // enroll needs the PRIVATE key for proof-of-possession (audit #11);
+                // the SDK derives the public half + ECDH proof natively.
+                let enrollReq = self.json(["token": token, "name": device, "wg_private_key": priv, "wg_public_key": pub])
                 let dev = try FluxpeerNative.unwrap(FluxpeerNative.enroll(enrollReq)) as? [String: Any] ?? [:]
 
                 let networkId = (dev["network_id"] as? String).flatMap { $0.isEmpty ? nil : $0 }
@@ -75,6 +77,7 @@ final class FluxpeerPlugin: NSObject, FlutterStreamHandler {
                     "controlUrl": dev["control_server"] as? String ?? "",
                     "overlayV4": dev["address_v4"] as? String ?? "",
                     "deviceId": dev["id"] as? String ?? "",
+                    "auth_token": dev["auth_token"] as? String ?? "",
                     "pubkey": pub,
                     "client_prikey": priv,
                     "transport_protocol": "udp",
@@ -120,8 +123,9 @@ final class FluxpeerPlugin: NSObject, FlutterStreamHandler {
     private func resolveGateway(_ record: inout [String: Any]) {
         let ctrl = record["controlUrl"] as? String ?? ""
         let deviceId = record["deviceId"] as? String ?? ""
+        let authToken = record["auth_token"] as? String ?? ""
         guard !ctrl.isEmpty, !deviceId.isEmpty else { return }
-        let req = json(["ctrl": ctrl, "device_id": deviceId])
+        let req = json(["ctrl": ctrl, "device_id": deviceId, "auth_token": authToken])
         guard let gw = try? FluxpeerNative.unwrap(FluxpeerNative.gateway(req)) as? [String: Any] else { return }
         record["node_pubkey"] = gw["node_pubkey"]
         record["node_addr"] = gw["node_addr"]

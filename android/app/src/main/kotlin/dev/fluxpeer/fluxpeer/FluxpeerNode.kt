@@ -47,4 +47,15 @@ object FluxpeerNode {
     /** Engine → app upcall (JNI): exclude an egress socket fd from the VPN. */
     @JvmStatic
     fun protectSocket(fd: Int): Boolean = vpn?.protect(fd) ?: false
+
+    /**
+     * Engine → app upcall (JNI): the engine exited on its own (fatal error / lost
+     * its last path), NOT via [stopNode]. The service tears down so we don't leave
+     * a stale "connected" state — and the held wake lock + tun fd — behind a dead
+     * engine. No-op if no service is bound.
+     */
+    @JvmStatic
+    fun onEngineExit() {
+        (vpn as? FluxpeerVpnService)?.onEngineExit()
+    }
 }

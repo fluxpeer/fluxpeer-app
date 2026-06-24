@@ -117,7 +117,7 @@ class _JoinPageState extends State<JoinPage> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          // Explicit a11y label + stable test identifier (QA F2): the bare
+          // Explicit a11y label + stable test identifier: the bare
           // TextField exposed no accessibility name / addressable id.
           Semantics(
             identifier: 'joinTokenField',

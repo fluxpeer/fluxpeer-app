@@ -9,14 +9,17 @@ import '../models/models.dart';
 /// Bridge to the native tunnel host — iOS NetworkExtension (PacketTunnelProvider)
 /// / Android VpnService — which runs the fluxpeer node IN-PROCESS over FFI.
 ///
-/// Until the native side lands, a built-in MOCK backend (auto-enabled the first
-/// time a platform method is missing) drives the whole UI so the Flutter app is
-/// runnable standalone.
+/// A built-in MOCK backend exists for UI-only development, but production/QA
+/// builds must opt in explicitly with `--dart-define=FLUXPEER_ALLOW_MOCK=true`.
 class FluxpeerChannel {
   FluxpeerChannel._();
 
   static const MethodChannel _m = MethodChannel('dev.fluxpeer.app/flux');
   static const EventChannel _e = EventChannel('dev.fluxpeer.app/fluxStatus');
+  static const bool _allowMock = bool.fromEnvironment(
+    'FLUXPEER_ALLOW_MOCK',
+    defaultValue: false,
+  );
 
   static final _MockBackend _mock = _MockBackend();
   static bool _useMock = false;
@@ -61,8 +64,8 @@ class FluxpeerChannel {
     try {
       final r = await _m.invokeMethod('getCurrentState');
       return FxStateSnapshot.fromJson(Map<String, dynamic>.from(r as Map));
-    } catch (_) {
-      // any failure to reach the native host → fall back to the mock backend
+    } on MissingPluginException {
+      if (!_allowMock) rethrow;
       _useMock = true;
       return _mock.current;
     }
@@ -75,22 +78,31 @@ class FluxpeerChannel {
     try {
       final r = await _m.invokeMethod('permissionStatus');
       return Map<String, dynamic>.from(r as Map);
-    } catch (_) {
+    } on MissingPluginException {
+      if (!_allowMock) rethrow;
       _useMock = true;
       // Mock: pretend nothing granted so the UI is exercisable standalone.
-      return {'vpn': false, 'battery': false, 'notifications': false, 'autostart': null};
+      return {
+        'vpn': false,
+        'battery': false,
+        'notifications': false,
+        'autostart': null,
+      };
     }
   }
 
   static Future<void> requestVpn() => _grant('requestVpn');
-  static Future<void> requestBatteryExemption() => _grant('requestBatteryExemption');
+  static Future<void> requestBatteryExemption() =>
+      _grant('requestBatteryExemption');
   static Future<void> requestNotifications() => _grant('requestNotifications');
   static Future<void> openAutoStart() => _grant('openAutoStart');
 
   static Future<void> _grant(String method) async {
     try {
       await _m.invokeMethod(method);
-    } catch (_) {/* mock / unsupported — no-op */}
+    } catch (_) {
+      /* mock / unsupported — no-op */
+    }
   }
 
   /// Real-time status stream from the tunnel host.
@@ -98,9 +110,10 @@ class FluxpeerChannel {
     if (_useMock) return _mock.stream;
     try {
       return _e.receiveBroadcastStream().map(
-            (e) => FxStateSnapshot.fromJson(Map<String, dynamic>.from(e as Map)),
-          );
-    } catch (_) {
+        (e) => FxStateSnapshot.fromJson(Map<String, dynamic>.from(e as Map)),
+      );
+    } on MissingPluginException {
+      if (!_allowMock) rethrow;
       _useMock = true;
       return _mock.stream;
     }
@@ -132,7 +145,10 @@ class _MockBackend {
   Future<void> start(FxNetwork net) async {
     // First connect ever simulates the OS VPN-permission grant.
     if (!_authorized) {
-      current = FxStateSnapshot(state: FxConnState.authorizing, networkId: net.id);
+      current = FxStateSnapshot(
+        state: FxConnState.authorizing,
+        networkId: net.id,
+      );
       _ctrl.add(current);
       await Future<void>.delayed(const Duration(milliseconds: 900));
       _authorized = true;

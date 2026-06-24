@@ -72,9 +72,13 @@ class MainActivity : FlutterActivity() {
                 val pub = kp.optString("public_key")
                 val priv = kp.optString("private_key")
 
+                // enroll needs the PRIVATE key for proof-of-possession (audit #11):
+                // the SDK derives the public half + ECDH proof and the key never
+                // leaves the native side. (wg_public_key kept for back-compat/logging.)
                 val enrollReq = JSONObject()
                     .put("token", token)
                     .put("name", device.ifEmpty { "android" })
+                    .put("wg_private_key", priv)
                     .put("wg_public_key", pub)
                 val dev = FluxpeerBridge.unwrap(FluxpeerNative.enroll(enrollReq.toString())) as JSONObject
 
