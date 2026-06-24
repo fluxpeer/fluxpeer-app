@@ -79,6 +79,10 @@ class FluxpeerVpnService : VpnService(), FluxpeerNative.EventSink {
                 // no-op, NOT a second engine (see [engineActive]). The Watchdog still
                 // revives us after real process death, where engineActive starts false.
                 if (!engineActive.compareAndSet(false, true)) {
+                    // Still MUST call startForeground() within ~5s of every
+                    // startForegroundService(), even for a duplicate START we ignore,
+                    // or Android 8+ throws ForegroundServiceDidNotStartInTimeAllowed.
+                    startForeground(NOTIFY_ID, notification("Connected"))
                     return START_REDELIVER_INTENT
                 }
                 networkId = id
