@@ -85,6 +85,9 @@ class MainActivity : FlutterActivity() {
                     .put("controlUrl", dev.optString("control_server"))
                     .put("overlayV4", dev.optString("address_v4"))
                     .put("deviceId", dev.optString("id"))
+                    // Per-device auth token issued at enroll — the node sends it as the
+                    // bearer on its control calls (config pull / endpoints / routes).
+                    .put("auth_token", dev.optString("auth_token"))
                     .put("pubkey", pub)
                     .put("client_prikey", priv)
                     .put("transport_protocol", "udp")
