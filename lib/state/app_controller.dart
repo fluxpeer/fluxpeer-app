@@ -208,7 +208,7 @@ class AppController extends GetxController with WidgetsBindingObserver {
 
   /// Startup locale: an explicit saved choice wins; otherwise follow the device
   /// locale (zh → Simplified Chinese), falling back to English. Fixes the app
-  /// defaulting to English on a zh-locale device (QA F3).
+  /// defaulting to English on a zh-locale device.
   Locale get startupLocale {
     switch (savedLang) {
       case 'zh_Hans':

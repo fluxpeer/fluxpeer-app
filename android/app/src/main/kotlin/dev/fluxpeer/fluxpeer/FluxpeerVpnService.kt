@@ -265,6 +265,20 @@ class FluxpeerVpnService : VpnService(), FluxpeerNative.EventSink {
         return parts[0] to prefix
     }
 
+    /**
+     * Engine upcall (full-node path): the engine exited on its own — not via
+     * stopNode — so tear down instead of showing a stale "connected" state. The
+     * upcall arrives on an engine thread; teardown touches service/foreground
+     * state, so hop to the main thread first.
+     */
+    fun onEngineExit() {
+        android.os.Handler(android.os.Looper.getMainLooper()).post {
+            // Only if we still think we're up (ignore a late upcall racing a
+            // user-initiated stop that already tore us down).
+            if (running) teardown("error", networkId)
+        }
+    }
+
     /** Engine upcall (worker thread): connected=true after handshake, false on close. */
     override fun onEvent(connected: Boolean, data: String, error: String) {
         if (!connected) {

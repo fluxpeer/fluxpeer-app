@@ -53,8 +53,10 @@ object FluxpeerNative {
 
     /**
      * Enroll a join token: `req` =
-     * {"token":"fp://join/<b64>","name":"...","wg_public_key":"<hex>"}
-     * (or {"ctrl","code",...}). result = device identity + control_server.
+     * {"token":"fp://join/<b64>","name":"...","wg_private_key":"<hex>"}
+     * (or {"ctrl","code",...}). The private key drives proof-of-possession (audit
+     * #11) and the public half is derived natively. result = device identity +
+     * control_server.
      */
     external fun enroll(req: String): String
 
