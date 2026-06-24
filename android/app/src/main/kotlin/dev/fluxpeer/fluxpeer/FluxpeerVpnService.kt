@@ -10,6 +10,7 @@ import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.os.PowerManager
 import org.json.JSONObject
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
 
 /**
@@ -32,6 +33,15 @@ class FluxpeerVpnService : VpnService(), FluxpeerNative.EventSink {
 
     @Volatile
     private var networkId: String? = null
+
+    // Singleton guard: exactly ONE engine per service instance. onStartCommand can
+    // fire repeatedly (Watchdog re-schedule, START_REDELIVER redelivery, a double
+    // tap, boot auto-reconnect). Without this, each fire spawns another runNode →
+    // two node engines bind two wg sockets + two relay connections under the SAME
+    // identity, crossing wg sessions so the peer's return traffic is delivered to
+    // the wrong socket and black-holed. Set true when an engine is starting, cleared
+    // on teardown/destroy (process death resets it for free → Watchdog can revive).
+    private val engineActive = AtomicBoolean(false)
 
     // Partial wake lock so the engine's heartbeat keeps ticking under Doze / lock
     // screen on aggressive (esp. Chinese OEM) ROMs. Held only while connected.
@@ -65,6 +75,12 @@ class FluxpeerVpnService : VpnService(), FluxpeerNative.EventSink {
                     stopSelf()
                     return START_NOT_STICKY
                 }
+                // Already have a live/starting engine? A duplicate START must be a
+                // no-op, NOT a second engine (see [engineActive]). The Watchdog still
+                // revives us after real process death, where engineActive starts false.
+                if (!engineActive.compareAndSet(false, true)) {
+                    return START_REDELIVER_INTENT
+                }
                 networkId = id
                 running = true
                 startForeground(NOTIFY_ID, notification("Connecting…"))
@@ -89,55 +105,58 @@ class FluxpeerVpnService : VpnService(), FluxpeerNative.EventSink {
         val overlayV4 = record.optString("overlayV4")
         FluxpeerBridge.emit("connecting", networkId = id, overlayV4 = overlayV4.ifEmpty { null })
 
-        // The gateway connect params (node_*) aren't in `/enroll`; resolve them
-        // from the control-server's gateway-config endpoint and merge them in.
-        if (record.optString("node_addr").isEmpty() || record.optString("node_pubkey").isEmpty()) {
-            resolveGateway(record)
-        }
-        // Still missing → no peer in the network advertises a reachable endpoint
-        // yet. Surface that clearly instead of silently failing the handshake.
-        if (record.optString("node_addr").isEmpty() || record.optString("node_pubkey").isEmpty()) {
+        // The FULL node engine pulls its own peer list + relay directory + STUN from
+        // the control-server (the phone is a first-class mesh peer, not a thin gateway
+        // client), so unlike the old two-phase dispatcher we need only identity + URL.
+        val ctrl = record.optString("controlUrl")
+        val prikey = record.optString("client_prikey")
+        val deviceId = record.optString("deviceId")
+        if (ctrl.isEmpty() || prikey.isEmpty() || deviceId.isEmpty() || overlayV4.isEmpty()) {
             FluxpeerBridge.emit("error", networkId = id, overlayV4 = overlayV4.ifEmpty { null })
             stopSelf()
             return
         }
 
-        // Phase 1: handshake only.
-        val req = JSONObject().apply {
-            put("client_prikey", record.optString("client_prikey"))
-            put("node_pubkey", record.optString("node_pubkey"))
-            put("node_addr", record.optString("node_addr"))
-            put("node_port", record.optInt("node_port"))
-            // A user-chosen mode (anti-censorship / bonded) wins over the gateway's
-            // advertised default; 'auto' leaves user_transport empty → use default.
-            put("transport_protocol", record.optString("user_transport").ifEmpty { record.optString("transport_protocol", "udp") })
-            put("crypto_protocol", record.optString("crypto_protocol", "noise"))
-            put("iface_ipv4", overlayV4)
-            record.optString("iface_ipv6").takeIf { it.isNotEmpty() }?.let { put("iface_ipv6", it) }
-            record.optString("node_id").takeIf { it.isNotEmpty() }?.let { put("node_id", it) }
-        }
-        try {
-            FluxpeerBridge.unwrap(FluxpeerNative.connectHandshakeOnly(req.toString(), this))
-        } catch (e: Exception) {
-            FluxpeerBridge.emit("error", networkId = id, overlayV4 = overlayV4.ifEmpty { null })
-            stopSelf()
-            return
-        }
-
-        // Phase 2: build the TUN and hand its fd to the engine.
+        // Build the OS TUN first: the engine adopts its fd (on Android the app — not
+        // the engine — owns the VpnService, so it can't create a device itself).
         val pfd = try {
             buildTun(record, overlayV4)
         } catch (e: Exception) {
-            FluxpeerNative.disconnect()
             FluxpeerBridge.emit("error", networkId = id, overlayV4 = overlayV4.ifEmpty { null })
             stopSelf()
             return
         }
         tun = pfd
-        try {
-            FluxpeerBridge.unwrap(FluxpeerNative.attachTun(pfd.fd))
+
+        // Expose this service so the engine's `protectSocket` upcall can exclude its
+        // egress sockets from the VPN (else our own wg packets loop back into the tun).
+        FluxpeerNode.vpn = this
+
+        // Node config (see node/src/config.rs::Config). `tun_name`/`prefix_len` are
+        // required by the schema but unused once a fd is injected — the platform owns
+        // the device's address/routes/MTU. The engine sets `tun_fd` from the fd arg.
+        val cfg = JSONObject().apply {
+            put("private_key", prikey)
+            put("device_id", deviceId)
+            put("control_server", ctrl)
+            put("listen_port", record.optInt("listenPort", 41820))
+            put("tun_name", "fp0")
+            put("prefix_len", 32)
+            record.optInt("mtu", 0).takeIf { it > 0 }?.let { put("mtu", it) }
+        }
+        // Transfer fd ownership to the engine: fp-tun adopts the fd (Fd::new) and
+        // closes it when the engine stops, so detachFd() here prevents the
+        // ParcelFileDescriptor from double-closing the same descriptor.
+        val fd = pfd.detachFd()
+        val ok = try {
+            JSONObject(FluxpeerNode.runNode(cfg.toString(), fd)).optBoolean("ok", false)
         } catch (e: Exception) {
-            teardown("error", null)
+            false
+        }
+        if (!ok) {
+            // Engine never took the fd → reclaim and close it ourselves.
+            runCatching { ParcelFileDescriptor.adoptFd(fd).close() }
+            teardown("error", id)
             return
         }
 
@@ -167,33 +186,6 @@ class FluxpeerVpnService : VpnService(), FluxpeerNative.EventSink {
         wakeLock = null
     }
 
-    /**
-     * Fill the gateway connect params (node_pubkey/addr/port + routes) by asking
-     * the control-server `/devices/:id/gateway`. Best-effort: on any failure the
-     * record stays incomplete and `connect` reports the gap. Persists on success.
-     */
-    private fun resolveGateway(record: JSONObject) {
-        val ctrl = record.optString("controlUrl")
-        val deviceId = record.optString("deviceId")
-        if (ctrl.isEmpty() || deviceId.isEmpty()) return
-        try {
-            val req = JSONObject().put("ctrl", ctrl).put("device_id", deviceId)
-            val gw = FluxpeerBridge.unwrap(FluxpeerNative.gateway(req.toString())) as JSONObject
-            record.put("node_pubkey", gw.optString("node_pubkey"))
-            record.put("node_addr", gw.optString("node_addr"))
-            record.put("node_port", gw.optInt("node_port"))
-            gw.optString("transport_protocol").takeIf { it.isNotEmpty() }
-                ?.let { record.put("transport_protocol", it) }
-            gw.optJSONArray("allowed_routes")?.let { record.put("allowedRoutes", it) }
-            gw.optJSONArray("dns")?.let { if (it.length() > 0) record.put("dns", it) }
-            if (gw.has("mtu")) record.put("mtu", gw.optInt("mtu", record.optInt("mtu", 1380)))
-            record.optString("networkId").takeIf { it.isNotEmpty() }
-                ?.let { FluxpeerBridge.saveNetwork(this, it, record) }
-        } catch (e: Exception) {
-            // Leave node_* empty; connect() surfaces the gap.
-        }
-    }
-
     private fun buildTun(record: JSONObject, overlayV4: String): ParcelFileDescriptor {
         val b = Builder()
         b.setSession("fluxpeer")
@@ -201,13 +193,27 @@ class FluxpeerVpnService : VpnService(), FluxpeerNative.EventSink {
         b.setMtu(record.optInt("mtu", 1380))
 
         // DNS (optional).
+        var dnsCount = 0
         record.optJSONArray("dns")?.let { dns ->
-            for (i in 0 until dns.length()) dns.optString(i).takeIf { it.isNotEmpty() }?.let { b.addDnsServer(it) }
+            for (i in 0 until dns.length()) dns.optString(i).takeIf { it.isNotEmpty() }?.let {
+                b.addDnsServer(it); dnsCount++
+            }
+        }
+
+        val fullTunnel = record.optBoolean("exitNode", false)
+
+        // Full-tunnel with no configured DNS would black-hole all name resolution: the
+        // phone's normal (LAN) resolver is now routed INTO the tunnel and unreachable
+        // through the exit. Fall back to a public resolver reachable via the exit so
+        // names resolve. (Split-tunnel keeps using the system DNS off-tunnel.)
+        if (fullTunnel && dnsCount == 0) {
+            b.addDnsServer("1.1.1.1")
+            b.addDnsServer("8.8.8.8")
         }
 
         // Routes: full-tunnel only when exitNode; otherwise route the overlay
         // ranges (split-tunnel default — never 0.0.0.0/0 implicitly).
-        if (record.optBoolean("exitNode", false)) {
+        if (fullTunnel) {
             b.addRoute("0.0.0.0", 0)
         } else {
             val routes = record.optJSONArray("allowedRoutes")
@@ -262,7 +268,11 @@ class FluxpeerVpnService : VpnService(), FluxpeerNative.EventSink {
 
     private fun teardown(state: String, id: String?) {
         releaseWakeLock()
-        runCatching { FluxpeerNative.disconnect() }
+        engineActive.set(false) // allow a future (re)connect to start an engine
+        // Stop the engine FIRST: it owns the tun fd and closes it on shutdown. Then
+        // drop our (now-detached) ParcelFileDescriptor handle — close() is a no-op.
+        runCatching { FluxpeerNode.stopNode() }
+        FluxpeerNode.vpn = null
         runCatching { tun?.close() }
         tun = null
         FluxpeerBridge.emit(state, networkId = id ?: networkId)
@@ -272,7 +282,10 @@ class FluxpeerVpnService : VpnService(), FluxpeerNative.EventSink {
 
     override fun onDestroy() {
         running = false
+        engineActive.set(false)
         releaseWakeLock()
+        runCatching { FluxpeerNode.stopNode() }
+        FluxpeerNode.vpn = null
         runCatching { tun?.close() }
         tun = null
         super.onDestroy()
