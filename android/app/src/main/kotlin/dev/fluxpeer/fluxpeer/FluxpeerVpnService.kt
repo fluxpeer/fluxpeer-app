@@ -143,6 +143,9 @@ class FluxpeerVpnService : VpnService(), FluxpeerNative.EventSink {
             put("private_key", prikey)
             put("device_id", deviceId)
             put("control_server", ctrl)
+            // Per-device auth token (from enroll): the engine sends it as the bearer
+            // on its control-server calls, which now reject unauthenticated devices.
+            record.optString("auth_token").takeIf { it.isNotEmpty() }?.let { put("auth_token", it) }
             put("listen_port", record.optInt("listenPort", 41820))
             put("tun_name", "fp0")
             put("prefix_len", 32)
