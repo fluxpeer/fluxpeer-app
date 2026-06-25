@@ -118,11 +118,19 @@ class MainActivity : FlutterActivity() {
             result.error("bad_args", "start: missing network id", null)
             return
         }
-        // Fold the current connection-mode choice into the native record so connect
-        // honors it ('' = auto → use the gateway default).
+        // Fold the user-editable settings from the Dart record into the native
+        // record so a connect honors the LATEST in-app settings, not the values
+        // captured at join. Without this the exit-node (full-tunnel) toggle, DNS,
+        // MTU and exclude-routes edits never reach the VpnService.
         runCatching {
             FluxpeerBridge.loadNetwork(this, networkId)?.let { rec ->
                 rec.put("user_transport", passed?.optString("user_transport").orEmpty())
+                passed?.let { p ->
+                    rec.put("exitNode", p.optBoolean("exitNode", rec.optBoolean("exitNode", false)))
+                    rec.put("mtu", p.optInt("mtu", rec.optInt("mtu", 1380)))
+                    p.optJSONArray("dns")?.let { rec.put("dns", it) }
+                    p.optJSONArray("excludeRoutes")?.let { rec.put("excludeRoutes", it) }
+                }
                 FluxpeerBridge.saveNetwork(this, networkId, rec)
             }
         }
