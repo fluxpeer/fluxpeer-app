@@ -28,8 +28,9 @@ import kotlin.concurrent.thread
  */
 class FluxpeerVpnService : VpnService(), FluxpeerNative.EventSink {
 
-    @Volatile
-    private var tun: ParcelFileDescriptor? = null
+    private val tunFdLock = Any()
+    private var detachedTunFd: Int = -1
+    private var engineOwnsTunFd: Boolean = false
 
     @Volatile
     private var networkId: String? = null
@@ -130,7 +131,6 @@ class FluxpeerVpnService : VpnService(), FluxpeerNative.EventSink {
             stopSelf()
             return
         }
-        tun = pfd
 
         // Expose this service so the engine's `protectSocket` upcall can exclude its
         // egress sockets from the VPN (else our own wg packets loop back into the tun).
@@ -151,10 +151,18 @@ class FluxpeerVpnService : VpnService(), FluxpeerNative.EventSink {
             put("prefix_len", 32)
             record.optInt("mtu", 0).takeIf { it > 0 }?.let { put("mtu", it) }
         }
-        // Transfer fd ownership to the engine: fp-tun adopts the fd (Fd::new) and
-        // closes it when the engine stops, so detachFd() here prevents the
-        // ParcelFileDescriptor from double-closing the same descriptor.
-        val fd = pfd.detachFd()
+        // Transfer fd ownership out of the ParcelFileDescriptor before calling JNI.
+        // `runNode` returns after spawning the native engine thread; Rust adopts the
+        // raw fd shortly after. Until runNode reports success Kotlin still owns the
+        // detached fd and must close it on error. After success the engine owns it.
+        val fd = try {
+            pfd.detachFd()
+        } catch (e: Exception) {
+            runCatching { pfd.close() }
+            teardown("error", id)
+            return
+        }
+        setPendingTunFd(fd)
         val ok = try {
             JSONObject(FluxpeerNode.runNode(cfg.toString(), fd)).optBoolean("ok", false)
         } catch (e: Exception) {
@@ -162,10 +170,11 @@ class FluxpeerVpnService : VpnService(), FluxpeerNative.EventSink {
         }
         if (!ok) {
             // Engine never took the fd → reclaim and close it ourselves.
-            runCatching { ParcelFileDescriptor.adoptFd(fd).close() }
+            closePendingTunFd()
             teardown("error", id)
             return
         }
+        markTunFdOwnedByEngine()
 
         acquireWakeLock()
         FluxpeerBridge.saveLastActive(this, id) // remember for boot reconnect
@@ -191,6 +200,33 @@ class FluxpeerVpnService : VpnService(), FluxpeerNative.EventSink {
     private fun releaseWakeLock() {
         runCatching { wakeLock?.takeIf { it.isHeld }?.release() }
         wakeLock = null
+    }
+
+    private fun setPendingTunFd(fd: Int) {
+        synchronized(tunFdLock) {
+            detachedTunFd = fd
+            engineOwnsTunFd = false
+        }
+    }
+
+    private fun markTunFdOwnedByEngine() {
+        synchronized(tunFdLock) {
+            engineOwnsTunFd = true
+            detachedTunFd = -1
+        }
+    }
+
+    private fun closePendingTunFd() {
+        val fd = synchronized(tunFdLock) {
+            if (engineOwnsTunFd || detachedTunFd < 0) {
+                -1
+            } else {
+                detachedTunFd.also { detachedTunFd = -1 }
+            }
+        }
+        if (fd >= 0) {
+            runCatching { ParcelFileDescriptor.adoptFd(fd).close() }
+        }
     }
 
     private fun buildTun(record: JSONObject, overlayV4: String): ParcelFileDescriptor {
@@ -239,10 +275,6 @@ class FluxpeerVpnService : VpnService(), FluxpeerNative.EventSink {
             }
         }
 
-        // Don't loop our own app's traffic back through the tunnel.
-        runCatching { b.addDisallowedApplication(packageName) }
-
-        b.setBlocking(false)
         return b.establish() ?: throw IllegalStateException("establish() returned null (VPN not prepared?)")
     }
 
@@ -290,12 +322,12 @@ class FluxpeerVpnService : VpnService(), FluxpeerNative.EventSink {
     private fun teardown(state: String, id: String?) {
         releaseWakeLock()
         engineActive.set(false) // allow a future (re)connect to start an engine
-        // Stop the engine FIRST: it owns the tun fd and closes it on shutdown. Then
-        // drop our (now-detached) ParcelFileDescriptor handle — close() is a no-op.
+        // Stop the engine FIRST: once runNode succeeds it owns the tun fd and closes
+        // it on shutdown. If runNode failed before ownership transfer, close our
+        // still-pending detached fd here.
         runCatching { FluxpeerNode.stopNode() }
         FluxpeerNode.vpn = null
-        runCatching { tun?.close() }
-        tun = null
+        closePendingTunFd()
         FluxpeerBridge.emit(state, networkId = id ?: networkId)
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
@@ -307,8 +339,7 @@ class FluxpeerVpnService : VpnService(), FluxpeerNative.EventSink {
         releaseWakeLock()
         runCatching { FluxpeerNode.stopNode() }
         FluxpeerNode.vpn = null
-        runCatching { tun?.close() }
-        tun = null
+        closePendingTunFd()
         super.onDestroy()
     }
 
