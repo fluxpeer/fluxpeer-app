@@ -14,3 +14,17 @@
 -keep class androidx.work.impl.WorkManagerInitializer { *; }
 -keep class androidx.work.WorkManagerInitializer { *; }
 -keep class androidx.work.impl.WorkDatabase { *; }
+
+# Rust engines call into app classes via JNI and Android looks up native methods
+# by their unmangled Java/Kotlin names. These members may otherwise look unused
+# to R8 because the calls originate in libfp_node_*.
+-keep class dev.fluxpeer.fluxpeer.** { *; }
+-keepclasseswithmembernames class * {
+    native <methods>;
+}
+-keepclassmembers class dev.fluxpeer.fluxpeer.FluxpeerNode {
+    public static boolean protectSocket(int);
+    public static void onEngineExit();
+    public static native java.lang.String runNode(java.lang.String, int);
+    public static native void stopNode();
+}
