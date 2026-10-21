@@ -30,7 +30,7 @@ object FluxpeerNode {
     // Rust shim in android.rs expects). Without it, an `object`'s `external fun` is an
     // INSTANCE method (2nd arg = jobject) → "jclass has wrong type" abort at runtime.
     @JvmStatic
-    external fun runNode(cfgJson: String, tunFd: Int): String
+    external fun runNode(cfgJson: String, tunFd: Int, generation: Long): String
 
     /** Stop the running engine (signals shutdown; the tun fd is then safe to close). */
     @JvmStatic
@@ -48,6 +48,12 @@ object FluxpeerNode {
     @JvmStatic
     fun protectSocket(fd: Int): Boolean = vpn?.protect(fd) ?: false
 
+    /** Engine-applied route configuration, fenced by engine generation. */
+    @JvmStatic
+    fun onRoutes(generation: Long, json: String) {
+        (vpn as? FluxpeerVpnService)?.onRoutes(generation, json)
+    }
+
     /**
      * Engine → app upcall (JNI): the engine exited on its own (fatal error / lost
      * its last path), NOT via [stopNode]. The service tears down so we don't leave
@@ -55,7 +61,7 @@ object FluxpeerNode {
      * engine. No-op if no service is bound.
      */
     @JvmStatic
-    fun onEngineExit() {
-        (vpn as? FluxpeerVpnService)?.onEngineExit()
+    fun onEngineExit(generation: Long) {
+        (vpn as? FluxpeerVpnService)?.onEngineExit(generation)
     }
 }

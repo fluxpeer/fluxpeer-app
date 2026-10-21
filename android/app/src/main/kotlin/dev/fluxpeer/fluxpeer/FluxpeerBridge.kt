@@ -43,11 +43,13 @@ object FluxpeerBridge {
         overlayV4: String? = snapshot["overlayV4"] as? String,
         connectedAtMs: Long? = snapshot["connectedAtMs"] as? Long,
         peers: List<Map<String, Any?>> = emptyList(),
+        warning: String? = null,
     ) {
         val snap = mutableMapOf<String, Any?>("state" to state, "peers" to peers)
         if (networkId != null) snap["networkId"] = networkId
         if (overlayV4 != null) snap["overlayV4"] = overlayV4
         if (connectedAtMs != null) snap["connectedAtMs"] = connectedAtMs
+        if (!warning.isNullOrEmpty()) snap["warning"] = warning
         snapshot = snap
         main.post { sink?.success(snap) }
     }
@@ -89,6 +91,21 @@ object FluxpeerBridge {
         return runCatching { JSONObject(raw) }.getOrNull()
     }
 
+    /** Engine cache has its own preferences and identity key; it never rewrites settings. */
+    internal fun saveEngineConfig(ctx: Context, networkId: String, record: JSONObject, config: JSONObject) {
+        ctx.getSharedPreferences("fluxpeer_engine_configs", Context.MODE_PRIVATE)
+            .edit().putString(engineConfigKey(networkId, record), config.toString()).apply()
+    }
+
+    internal fun loadEngineConfig(ctx: Context, networkId: String, record: JSONObject): JSONObject? {
+        val raw = ctx.getSharedPreferences("fluxpeer_engine_configs", Context.MODE_PRIVATE)
+            .getString(engineConfigKey(networkId, record), null) ?: return null
+        return runCatching { JSONObject(raw) }.getOrNull()
+    }
+
+    private fun engineConfigKey(networkId: String, record: JSONObject): String =
+        JSONArray(listOf(networkId, record.optString("controlUrl"), record.optString("deviceId"), record.optString("pubkey"))).toString()
+
     /** The network last brought up — used by [BootReceiver] to reconnect on boot. */
     fun saveLastActive(ctx: Context, networkId: String?) {
         ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().apply {
@@ -108,8 +125,10 @@ object FluxpeerBridge {
         "deviceId" to record.optString("deviceId").ifEmpty { null },
         "pubkey" to record.optString("pubkey").ifEmpty { null },
         "mtu" to record.optInt("mtu", 1380),
+        "mtuExplicit" to record.optBoolean("mtuExplicit", record.has("mtu") && record.optInt("mtu") != 1380),
         "dns" to record.optJSONArray("dns").toStringList(),
         "exitNode" to record.optBoolean("exitNode", false),
+        "transportProtocol" to record.optString("user_transport", "auto").ifEmpty { "auto" },
         "excludeRoutes" to record.optJSONArray("excludeRoutes").toStringList(),
     )
 

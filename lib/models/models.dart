@@ -32,6 +32,7 @@ class FxNetwork {
   final String? pubkey;
   // local settings (applied on connect)
   final int mtu;
+  final bool mtuExplicit;
   final List<String> dns;
   final bool exitNode;
   final List<String> excludeRoutes;
@@ -48,6 +49,7 @@ class FxNetwork {
     this.deviceId,
     this.pubkey,
     this.mtu = 1380,
+    this.mtuExplicit = false,
     this.dns = const [],
     this.exitNode = false,
     this.excludeRoutes = const [],
@@ -58,6 +60,7 @@ class FxNetwork {
     String? name,
     String? overlayV4,
     int? mtu,
+    bool? mtuExplicit,
     List<String>? dns,
     bool? exitNode,
     List<String>? excludeRoutes,
@@ -71,6 +74,7 @@ class FxNetwork {
         deviceId: deviceId,
         pubkey: pubkey,
         mtu: mtu ?? this.mtu,
+        mtuExplicit: mtuExplicit ?? this.mtuExplicit,
         dns: dns ?? this.dns,
         exitNode: exitNode ?? this.exitNode,
         excludeRoutes: excludeRoutes ?? this.excludeRoutes,
@@ -86,6 +90,7 @@ class FxNetwork {
       'deviceId': deviceId,
       'pubkey': pubkey,
       'mtu': mtu,
+      'mtuExplicit': mtuExplicit,
       'dns': dns,
       'exitNode': exitNode,
       'excludeRoutes': excludeRoutes,
@@ -105,6 +110,7 @@ class FxNetwork {
         deviceId: j['deviceId'] as String?,
         pubkey: j['pubkey'] as String?,
         mtu: (j['mtu'] as num?)?.toInt() ?? 1380,
+        mtuExplicit: j['mtuExplicit'] as bool? ?? (j['mtu'] != null && j['mtu'] != 1380),
         dns: (j['dns'] as List?)?.cast<String>() ?? const [],
         exitNode: j['exitNode'] as bool? ?? false,
         excludeRoutes:
@@ -154,6 +160,7 @@ class FxStateSnapshot {
   final String? networkId;
   final String? overlayV4;
   final int? connectedAtMs;
+  final String? warning;
   final List<FxPeer> peers;
 
   const FxStateSnapshot({
@@ -161,6 +168,7 @@ class FxStateSnapshot {
     this.networkId,
     this.overlayV4,
     this.connectedAtMs,
+    this.warning,
     this.peers = const [],
   });
 
@@ -169,6 +177,7 @@ class FxStateSnapshot {
         networkId: j['networkId'] as String?,
         overlayV4: j['overlayV4'] as String?,
         connectedAtMs: (j['connectedAtMs'] as num?)?.toInt(),
+        warning: j['warning'] as String?,
         peers: (j['peers'] as List?)
                 ?.map((e) => FxPeer.fromJson(Map<String, dynamic>.from(e as Map)))
                 .toList() ??

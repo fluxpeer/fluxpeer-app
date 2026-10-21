@@ -51,4 +51,8 @@ dependencies {
     // Watchdog: periodic check that restarts the tunnel if an aggressive ROM
     // killed it (best-effort safety net on top of the foreground service).
     implementation("androidx.work:work-runtime-ktx:2.9.1")
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20240303")
+    testImplementation("org.robolectric:robolectric:4.14.1")
+    testImplementation("org.mockito:mockito-core:5.14.2")
 }

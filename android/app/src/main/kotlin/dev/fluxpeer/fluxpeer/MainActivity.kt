@@ -96,7 +96,7 @@ class MainActivity : FlutterActivity() {
                     .put("client_prikey", priv)
                     .put("transport_protocol", "udp")
                     .put("crypto_protocol", "noise")
-                    .put("mtu", 1380)
+                    .put("mtuExplicit", false)
                 // node_* gateway connect params are NOT in /enroll yet (step-6 gap);
                 // they get merged in once the control-server exposes a config fetch.
 
@@ -124,10 +124,11 @@ class MainActivity : FlutterActivity() {
         // MTU and exclude-routes edits never reach the VpnService.
         runCatching {
             FluxpeerBridge.loadNetwork(this, networkId)?.let { rec ->
-                rec.put("user_transport", passed?.optString("user_transport").orEmpty())
-                passed?.let { p ->
+                rec.put("user_transport", passed.optString("user_transport").orEmpty())
+                passed.let { p ->
                     rec.put("exitNode", p.optBoolean("exitNode", rec.optBoolean("exitNode", false)))
-                    rec.put("mtu", p.optInt("mtu", rec.optInt("mtu", 1380)))
+                    rec.put("mtuExplicit", p.optBoolean("mtuExplicit", false))
+                    if (p.optBoolean("mtuExplicit", false)) rec.put("mtu", p.getInt("mtu")) else rec.remove("mtu")
                     p.optJSONArray("dns")?.let { rec.put("dns", it) }
                     p.optJSONArray("excludeRoutes")?.let { rec.put("excludeRoutes", it) }
                 }

@@ -116,7 +116,13 @@ class AppController extends GetxController with WidgetsBindingObserver {
     _apply(await FluxpeerChannel.getCurrentState());
   }
 
+  String? _lastWarning;
+
   void _apply(FxStateSnapshot s) {
+    if (s.warning != null && s.warning != _lastWarning) {
+      Get.snackbar('fluxpeer', s.warning!);
+    }
+    _lastWarning = s.warning;
     conn.value = s.state;
     peers.assignAll(s.peers);
     overlay.value = s.overlayV4 ?? active?.overlayV4;

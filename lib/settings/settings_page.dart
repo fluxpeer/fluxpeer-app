@@ -28,7 +28,7 @@ class _SettingsPageState extends State<SettingsPage> {
   @override
   void initState() {
     super.initState();
-    _mtu = TextEditingController(text: '${widget.net.mtu}');
+    _mtu = TextEditingController(text: widget.net.mtuExplicit ? '${widget.net.mtu}' : '');
     _dns = TextEditingController(text: widget.net.dns.join(', '));
     _exclude = TextEditingController(text: widget.net.excludeRoutes.join(', '));
     _exit = widget.net.exitNode;
@@ -48,6 +48,7 @@ class _SettingsPageState extends State<SettingsPage> {
   void _save() {
     final updated = widget.net.copyWith(
       mtu: int.tryParse(_mtu.text.trim()) ?? widget.net.mtu,
+      mtuExplicit: _mtu.text.trim().isNotEmpty,
       dns: _csv(_dns.text),
       exitNode: _exit,
       excludeRoutes: _csv(_exclude.text),
@@ -153,6 +154,7 @@ class _SettingsPageState extends State<SettingsPage> {
             style: FxText.body,
             decoration: InputDecoration(
                 labelText: 'settings.mtu'.tr,
+                hintText: 'Auto',
                 border: const OutlineInputBorder()),
           ),
           const SizedBox(height: FxSpace.x4),
