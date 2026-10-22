@@ -1,73 +1,80 @@
-# fluxpeer iOS — Network Extension setup
+# fluxpeer iOS — full node Network Extension
 
-The Rust engine, the Swift sources, and the entitlements are all in the repo.
-What remains is **Xcode project wiring** that can't be safely scripted into
-`Runner.xcodeproj/project.pbxproj` (a new target + signing). One-time steps:
+The Xcode project contains the Runner native bridge and the PacketTunnel extension,
+its dependency/embed phase, App Group entitlements and static xcframework links.
+Both targets use `fp-node-mobile-sys`. The old dispatcher handshake/attach ABI and
+cached gateway selection are no longer used by iOS.
 
-## 1. Build the engine xcframework
+## Build
+
+From the sibling core repository:
 
 ```sh
-scripts/build-ios.sh            # release; --debug for a faster local build
+scripts/build-ios.sh --debug     # omit --debug for release
 ```
 
-Produces `ios/Frameworks/Fluxpeer.xcframework` (device + simulator slices,
-`import FluxpeerFFI` exposes all `fp_*` symbols; gitignored — regenerate on
-demand).
+This produces the gitignored `ios/Frameworks/Fluxpeer.xcframework` with device
+arm64 and simulator arm64 static libraries, a checked C ABI header and module map.
+Rebuild it after Rust changes. Intel simulator slices are not included.
 
-## 2. Add the PacketTunnel extension target
+From this app repository, for an unsigned arm64 simulator build:
 
-In Xcode (`Runner.xcworkspace`):
-
-1. **File ▸ New ▸ Target… ▸ Network Extension** (or *Packet Tunnel Provider*).
-   - Product name: **PacketTunnel**
-   - Bundle id: **dev.fluxpeer.fluxpeer.PacketTunnel** (must match
-     `FluxpeerPlugin.extensionBundleId`).
-2. Delete the auto-generated `PacketTunnelProvider.swift`; instead add the repo
-   files to the **PacketTunnel** target:
-   - `ios/PacketTunnel/PacketTunnelProvider.swift`
-   - `ios/PacketTunnel/FluxpeerNative.swift`   *(also add to the Runner target)*
-   - Set the target's **Info.plist** to `ios/PacketTunnel/Info.plist` and its
-     **Code Signing Entitlements** to `ios/PacketTunnel/PacketTunnel.entitlements`.
-3. Add `ios/Runner/FluxpeerPlugin.swift` to the **Runner** target (already
-   referenced from `AppDelegate.swift`).
-
-## 3. Link the xcframework
-
-For **both** targets (Runner needs keygen/enroll/gateway; PacketTunnel runs the
-tunnel): General ▸ *Frameworks, Libraries, and Embedded Content* ▸ **+** ▸ Add
-Other ▸ `ios/Frameworks/Fluxpeer.xcframework`.
-- Runner: *Embed & Sign*. PacketTunnel: *Do Not Embed* (it links the same lib).
-
-## 4. Capabilities (both targets)
-
-- **App Groups**: enable `group.dev.fluxpeer.fluxpeer` on Runner *and*
-  PacketTunnel (already in the `.entitlements` files — just turn on the
-  capability so provisioning includes it).
-- **Network Extensions**: Runner gets *Personal VPN* (`allow-vpn`); PacketTunnel
-  gets *Packet Tunnel*. Both entitlement files are pre-written; point each
-  target's *Code Signing Entitlements* build setting at them.
-- Set `Runner` entitlements to `ios/Runner/Runner.entitlements`.
-
-## 5. Signing
-
-A paid Apple Developer account is required (the Network Extension +
-packet-tunnel-provider entitlement is not available to free teams). Set the same
-team on both targets.
-
-## Data flow (matches Android)
-
-```
-Dart  ──MethodChannel dev.fluxpeer.app/flux──►  FluxpeerPlugin (Runner)
-  join   → fp_generate_keypair + fp_enroll → persist record (App Group)
-  start  → fp_gateway (fill node_*) → NETunnelProviderManager.save + start
-                                              │
-                              providerConfiguration["flux_config"]
-                                              ▼
-                        PacketTunnelProvider (extension)
-  fp_connect_handshake_only → setTunnelNetworkSettings (split-tunnel)
-    → utun fd → fp_attach_tun → data plane live
-status ◄──EventChannel dev.fluxpeer.app/fluxStatus── NEVPNStatusDidChange
+```sh
+xcodebuild -project ios/Runner.xcodeproj -scheme Runner -configuration Debug \
+  -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' \
+  ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO build
 ```
 
-The Dart side (`lib/channel/fluxpeer_channel.dart`) is unchanged — its mock
-auto-disables once these native handlers respond.
+The repository retains its existing iOS 13 deployment settings. Xcode 27's simulator
+SDK rejects deployment targets below 15; for validation with that SDK add
+`IPHONEOS_DEPLOYMENT_TARGET=15.0` to the command. This build override does not establish
+iOS 13 runtime compatibility. Provisioning and on-device testing remain separate.
+
+## Signing and installation
+
+Use the same paid Apple Developer team for Runner and PacketTunnel. Provision
+`group.dev.fluxpeer.fluxpeer` for both targets and the packet-tunnel-provider
+Network Extension capability. Runner's Personal VPN entitlement is also retained.
+Select matching provisioning profiles in Xcode; no team or signing credentials
+are committed. The extension bundle id is `dev.fluxpeer.fluxpeer.PacketTunnel`.
+
+## Engine and settings contract
+
+Runner enrolls through the node SDK, persists the membership and merges typed
+local `use_exit`/`exitNode`, DNS, MTU, exclusions and transport settings. Private
+credentials come only from the saved membership. The engine fetches fresh control
+configuration on every start and uses the same raw WireGuard data plane as Android.
+
+PacketTunnel exchanges packets through the public `NEPacketTunnelFlow` API and a
+private datagram socket pair. It does not inspect private KVC properties or scan
+unrelated descriptors. The engine owns a duplicate of its socket endpoint and
+uses iOS's four-byte address-family framing; stopping joins the engine before the
+extension acknowledges teardown. No callback joins its own engine thread.
+
+Only engine-applied overlay/subnet routes, addresses, selected exit and DNS can
+produce OS settings. Split mode rejects both default prefixes. A selected exit
+plus explicit local opt-in installs IPv4 default and captures IPv6 default for
+discard in both directions; IPv6 exclusions cannot bypass that guard. The local
+`fd00::1` placeholder is used only when NE needs an IPv6 interface address but the
+control server assigned none. It is not a service endpoint.
+
+Ready follows successful network-settings completion. Generation checks reject
+late events, and a new start waits until the previous engine and outstanding NE
+settings operation finish. Engine exit, bridge error or settings failure cancels
+the tunnel with an error. Desktop-style host route/firewall commands are not used
+inside the extension. Client kill-switch is not implemented by this migration.
+
+## Host tests and remaining device checks
+
+```sh
+swiftc ios/PacketTunnel/TunnelPolicy.swift ios/PacketTunnel/TunnelLifecycle.swift \
+  ios/tests/TunnelPolicyTests.swift -o /tmp/fluxpeer-ios-policy-tests
+/tmp/fluxpeer-ios-policy-tests
+```
+
+The tests cover typed settings, family-aware routes, split/default filtering,
+IPv6 packet capture/discard, framing and stale generation rejection. Core Rust
+unit tests cover FFI fd ownership and generation-aware stop. Build success is not
+proof of a working Network Extension session. A signed physical device is still
+needed for iOS-to-node traffic, control/relay socket bypass, IPv6 leakage, network
+handoffs, reconnect/route changes and lifecycle failure checks.

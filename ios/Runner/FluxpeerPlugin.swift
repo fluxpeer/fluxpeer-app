@@ -10,7 +10,7 @@ import UserNotifications
 ///   - EventChannel  `dev.fluxpeer.app/fluxStatus` — live snapshots (NEVPNStatus)
 ///
 /// `join` (keygen + enroll) runs in this app process and persists a connect
-/// record into the shared App Group; `start` resolves the gateway, hands the
+/// record into the shared App Group; `start` merges local policy, hands the
 /// record to the PacketTunnelProvider via `providerConfiguration`, and starts it.
 final class FluxpeerPlugin: NSObject, FlutterStreamHandler {
 
@@ -107,7 +107,7 @@ final class FluxpeerPlugin: NSObject, FlutterStreamHandler {
         }
     }
 
-    /// Resolve the gateway, fold node_* into the record, then save + start the tunnel.
+    /// Pass complete local policy; the engine fetches fresh membership on every start.
     private func start(_ args: [String: Any], _ result: @escaping FlutterResult) {
         let net: [String: Any]
         var record: [String: Any]
@@ -120,27 +120,11 @@ final class FluxpeerPlugin: NSObject, FlutterStreamHandler {
             record = saved
         } catch { result(FlutterError(code: "start_failed", message: "\(error)", details: nil)); return }
 
-        let userTransport = (net["user_transport"] as? String) ?? ""
-
-        DispatchQueue.global().async {
-            if (record["node_addr"] as? String ?? "").isEmpty {
-                self.resolveGateway(&record)
-            }
-            // A user-chosen mode wins over the gateway-advertised default; the
-            // extension hands the record straight to the FFI, which reads
-            // `transport_protocol`. Empty userTransport = 'auto' → keep default.
-            if !userTransport.isEmpty { record["transport_protocol"] = userTransport }
-            do { try self.saveRecord(networkId, record) }
-            catch {
-                DispatchQueue.main.async { result(FlutterError(code: "save_failed", message: "\(error)", details: nil)) }
-                return
-            }
-            guard !(record["node_addr"] as? String ?? "").isEmpty else {
-                DispatchQueue.main.async { result(FlutterError(code: "no_gateway", message: "no reachable gateway yet", details: nil)) }
-                return
-            }
-            DispatchQueue.main.async { self.installAndStart(record, result) }
-        }
+        do {
+            record = try TunnelPolicy.merge(record, net)
+            try saveRecord(networkId, record)
+            installAndStart(record, result)
+        } catch { result(FlutterError(code: "start_failed", message: "\(error)", details: nil)) }
     }
 
     private func networkArgument(_ args: [String: Any]) throws -> [String: Any] {
@@ -207,27 +191,11 @@ final class FluxpeerPlugin: NSObject, FlutterStreamHandler {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { self.waitForStop(profile, deadline: deadline, complete: complete) }
     }
 
-    private func resolveGateway(_ record: inout [String: Any]) {
-        let ctrl = record["controlUrl"] as? String ?? ""
-        let deviceId = record["deviceId"] as? String ?? ""
-        let authToken = record["auth_token"] as? String ?? ""
-        guard !ctrl.isEmpty, !deviceId.isEmpty else { return }
-        let req = json(["ctrl": ctrl, "device_id": deviceId, "auth_token": authToken])
-        guard let gw = try? FluxpeerNative.unwrap(FluxpeerNative.gateway(req)) as? [String: Any] else { return }
-        record["node_pubkey"] = gw["node_pubkey"]
-        record["node_addr"] = gw["node_addr"]
-        record["node_port"] = gw["node_port"]
-        if let t = gw["transport_protocol"] as? String, !t.isEmpty { record["transport_protocol"] = t }
-        if let r = gw["allowed_routes"] { record["allowed_routes"] = r }
-        if let d = gw["dns"] as? [String], !d.isEmpty { record["dns"] = d }
-        if let m = gw["mtu"] { record["mtu"] = m }
-    }
-
     private func installAndStart(_ record: [String: Any], _ result: @escaping FlutterResult) {
         let mgr = manager ?? NETunnelProviderManager()
         let proto = NETunnelProviderProtocol()
         proto.providerBundleIdentifier = Self.extensionBundleId
-        proto.serverAddress = record["node_addr"] as? String ?? "fluxpeer"
+        proto.serverAddress = record["controlUrl"] as? String ?? "fluxpeer"
         proto.providerConfiguration = ["flux_config": json(record)]
         mgr.protocolConfiguration = proto
         mgr.localizedDescription = "fluxpeer"
@@ -235,7 +203,8 @@ final class FluxpeerPlugin: NSObject, FlutterStreamHandler {
         mgr.saveToPreferences { [weak self] error in
             if let error { return result(FlutterError(code: "save_failed", message: "\(error)", details: nil)) }
             // Reload (saveToPreferences invalidates the in-memory object) then start.
-            mgr.loadFromPreferences { _ in
+            mgr.loadFromPreferences { error in
+                if let error { result(FlutterError(code: "load_failed", message: "\(error)", details: nil)); return }
                 self?.manager = mgr
                 do { try mgr.connection.startVPNTunnel(); result(nil) }
                 catch { result(FlutterError(code: "start_failed", message: "\(error)", details: nil)) }
