@@ -25,6 +25,7 @@
 -keepclassmembers class dev.fluxpeer.fluxpeer.FluxpeerNode {
     public static boolean protectSocket(int);
     public static void onEngineExit(long);
+    public static void onReady(long);
     public static void onRoutes(long, java.lang.String);
     public static native java.lang.String runNode(java.lang.String, int, long);
     public static native void stopNode();

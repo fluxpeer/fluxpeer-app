@@ -33,7 +33,7 @@ Future<void> showNetworkSwitcher(BuildContext context) {
               (n) => ListTile(
                 leading: Icon(
                   Icons.hub_outlined,
-                  color: n.id == c.activeId.value ? Fx.brandGlow : Fx.fgMuted,
+                  color: n.key == c.activeId.value ? Fx.brandGlow : Fx.fgMuted,
                 ),
                 title: Text(n.name,
                     style: TextStyle(color: Fx.fgPrimary)),
@@ -41,11 +41,11 @@ Future<void> showNetworkSwitcher(BuildContext context) {
                     ? Text(n.overlayV4!,
                         style: TextStyle(color: Fx.fgMuted, fontSize: 12))
                     : null,
-                trailing: n.id == c.activeId.value
+                trailing: n.key == c.activeId.value
                     ? Icon(Icons.check, color: Fx.brandGlow)
                     : null,
                 onTap: () {
-                  c.switchTo(n.id);
+                  c.switchTo(n.key);
                   Navigator.pop(sheetCtx);
                 },
               ),

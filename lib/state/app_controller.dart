@@ -24,7 +24,9 @@ class AppController extends GetxController with WidgetsBindingObserver {
   final RxnInt connectedAtMs = RxnInt();
   final RxBool isMock = false.obs;
 
-  final GetStorage _box = GetStorage();
+  AppController({GetStorage? storage}) : _box = storage ?? GetStorage();
+
+  final GetStorage _box;
   StreamSubscription<FxStateSnapshot>? _sub;
 
   static const _kNetworks = 'networks';
@@ -34,7 +36,7 @@ class AppController extends GetxController with WidgetsBindingObserver {
 
   FxNetwork? get active {
     for (final n in networks) {
-      if (n.id == activeId.value) return n;
+      if (n.key == activeId.value) return n;
     }
     return null;
   }
@@ -64,37 +66,9 @@ class AppController extends GetxController with WidgetsBindingObserver {
   Future<void> _init() async {
     // Cold-start sync first — primes mock detection if the native tunnel host is
     // absent — then subscribe to the live status stream.
-    await _coldSync();
+    try { await _coldSync(); } catch (error) { _nativeError(error); return; }
     isMock.value = FluxpeerChannel.usingMock;
-    if (isMock.value && networks.isEmpty) _seedDemo();
-    _sub = FluxpeerChannel.statusStream().listen(_apply);
-  }
-
-  /// Demo networks so the full flow is explorable without enrolling (mock only).
-  void _seedDemo() {
-    networks.assignAll(const [
-      FxNetwork(
-        id: 'demo-home',
-        name: 'home-net',
-        controlUrl: 'https://demo.fluxpeer.dev',
-        overlayV4: '100.72.16.5',
-        deviceId: 'phone-01',
-        pubkey: 'mock-pk-home-9f2a7c1b',
-        dns: ['1.1.1.1'],
-      ),
-      FxNetwork(
-        id: 'demo-lab',
-        name: 'lab-mesh',
-        controlUrl: 'https://lab.fluxpeer.dev',
-        overlayV4: '100.72.40.2',
-        deviceId: 'phone-01',
-        pubkey: 'mock-pk-lab-3b81de07',
-        exitNode: true,
-        excludeRoutes: ['192.168.0.0/16'],
-      ),
-    ]);
-    activeId.value = 'demo-home';
-    _persist();
+    _sub = FluxpeerChannel.statusStream().listen(_apply, onError: _nativeError);
   }
 
   void _load() {
@@ -102,18 +76,27 @@ class AppController extends GetxController with WidgetsBindingObserver {
     networks.assignAll(
       raw.map((e) => FxNetwork.fromJson(Map<String, dynamic>.from(e as Map))),
     );
-    activeId.value =
-        _box.read<String>(_kActive) ?? (networks.isEmpty ? null : networks.first.id);
+    final saved = _box.read<String>(_kActive);
+    final matches = networks.where((n) => n.key == saved || n.id == saved).toList();
+    activeId.value = matches.length == 1 ? matches.single.key : null;
+    _persist();
   }
 
   void _persist() {
     _box.write(_kNetworks, networks.map((n) => n.toJson()).toList());
     final id = activeId.value;
-    if (id != null) _box.write(_kActive, id);
+    if (id != null) { _box.write(_kActive, id); } else { _box.remove(_kActive); }
   }
 
   Future<void> _coldSync() async {
     _apply(await FluxpeerChannel.getCurrentState());
+  }
+
+  void _nativeError(Object error) {
+    conn.value = FxConnState.error;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (Get.overlayContext != null) Get.snackbar('fluxpeer', error.toString());
+    });
   }
 
   String? _lastWarning;
@@ -128,14 +111,16 @@ class AppController extends GetxController with WidgetsBindingObserver {
     overlay.value = s.overlayV4 ?? active?.overlayV4;
     connectedAtMs.value = s.connectedAtMs;
     if (s.networkId != null && s.state != FxConnState.disconnected) {
-      activeId.value = s.networkId;
+      final matches = networks.where((n) => n.key == s.networkId || n.id == s.networkId).toList();
+      activeId.value = matches.length == 1 ? matches.single.key : null;
     }
   }
 
   Future<FxNetwork> joinToken(String token, String device) async {
     final net = await FluxpeerChannel.join(token, device);
+    networks.removeWhere((n) => n.key == net.key);
     networks.add(net);
-    activeId.value = net.id;
+    activeId.value = net.key;
     _persist();
     return net;
   }
@@ -143,32 +128,41 @@ class AppController extends GetxController with WidgetsBindingObserver {
   Future<void> toggle() async {
     final net = active;
     if (net == null) return;
-    if (isOn) {
-      conn.value = FxConnState.disconnecting;
-      await FluxpeerChannel.stopTunnel();
-    } else {
-      conn.value = FxConnState.connecting;
-      await FluxpeerChannel.startTunnel(net);
-    }
+    try {
+      if (isOn) {
+        conn.value = FxConnState.disconnecting;
+        await FluxpeerChannel.stopTunnel();
+      } else {
+        if (net.needsRejoin) throw StateError('Rejoin this network before connecting');
+        conn.value = FxConnState.connecting;
+        await FluxpeerChannel.startTunnel(net);
+      }
+    } catch (error) { _nativeError(error); }
   }
 
   Future<void> switchTo(String id) async {
     if (id == activeId.value) return;
-    if (isOn) await FluxpeerChannel.stopTunnel();
-    activeId.value = id;
-    _persist();
+    try {
+      if (isOn) await FluxpeerChannel.stopTunnel();
+      activeId.value = id;
+      _persist();
+    } catch (error) { _nativeError(error); }
   }
 
-  void leave(String id) {
-    networks.removeWhere((n) => n.id == id);
+  Future<void> leave(String id) async {
+    final matches = networks.where((n) => n.key == id);
+    if (matches.isEmpty) return;
+    // Native stop + credential/config deletion must finish before UI removal.
+    await FluxpeerChannel.leave(matches.first);
+    networks.removeWhere((n) => n.key == id);
     if (activeId.value == id) {
-      activeId.value = networks.isEmpty ? null : networks.first.id;
+      activeId.value = networks.isEmpty ? null : networks.first.key;
     }
     _persist();
   }
 
   void updateNetwork(FxNetwork net) {
-    final i = networks.indexWhere((n) => n.id == net.id);
+    final i = networks.indexWhere((n) => n.key == net.key);
     if (i >= 0) networks[i] = net;
     _persist();
   }
@@ -181,15 +175,16 @@ class AppController extends GetxController with WidgetsBindingObserver {
   }
 
   void rename(String id, String name) {
-    final i = networks.indexWhere((n) => n.id == id);
+    final i = networks.indexWhere((n) => n.key == id);
     if (i >= 0 && name.trim().isNotEmpty) {
       networks[i] = networks[i].copyWith(name: name.trim());
       _persist();
     }
   }
 
-  Future<void> refreshStatus() async =>
-      _apply(await FluxpeerChannel.getCurrentState());
+  Future<void> refreshStatus() async {
+    try { await _coldSync(); } catch (error) { _nativeError(error); }
+  }
 
   bool get usingMock => FluxpeerChannel.usingMock;
 
@@ -242,23 +237,29 @@ class AppController extends GetxController with WidgetsBindingObserver {
     Fx.applyDark(dark);
   }
 
-  /// Export all joined networks as a JSON backup (for reinstall recovery).
+  /// Export display settings; restored memberships must enroll again.
   String exportBackup() =>
-      jsonEncode(networks.map((n) => n.toJson()).toList());
+      jsonEncode(networks.map((n) => n.toBackup()).toList());
 
   /// Import a JSON backup; returns the number of new networks added.
   int importBackup(String raw) {
     final list = jsonDecode(raw) as List;
     var added = 0;
-    for (final e in list) {
+    // Validate every record before changing UI/storage; old backups also require rejoin.
+    final restored = list.map((e) {
       final n = FxNetwork.fromJson(Map<String, dynamic>.from(e as Map));
-      if (!networks.any((x) => x.id == n.id)) {
+      final display = FxNetwork.fromJson(n.toBackup());
+      display.key; // Validate the origin before applying any entry.
+      return display;
+    }).toList();
+    for (final n in restored) {
+      if (!networks.any((x) => x.key == n.key)) {
         networks.add(n);
         added++;
       }
     }
     if (activeId.value == null && networks.isNotEmpty) {
-      activeId.value = networks.first.id;
+      activeId.value = networks.first.key;
     }
     _persist();
     return added;

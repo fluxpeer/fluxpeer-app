@@ -10,8 +10,9 @@ internal class VpnLifecycle(
     private val worker: ExecutorService,
     private val connect: (String, Long) -> Unit,
     private val cleanup: () -> Unit,
-    private val emit: (String, String?) -> Unit,
+    private val emit: (String, String?, Long) -> Unit,
     private val idle: () -> Unit,
+    private val ownsWorker: Boolean = true,
 ) {
     private val lock = Any()
     private var active: String? = null
@@ -26,6 +27,7 @@ internal class VpnLifecycle(
     fun isIdle(): Boolean = synchronized(lock) { active == null && !stopping && pending == null }
     fun current(value: Long): Boolean = synchronized(lock) { token == value && active != null && !stopping && !destroyed }
     fun accepts(serial: Long): Boolean = synchronized(lock) { active != null && !stopping && !destroyed && engine.get() == serial }
+    fun references(id: String): Boolean = synchronized(lock) { active == id || pending == id }
     fun serial(): Long = engine.get()
     // Must run before establish(), which can close the previous engine's TUN.
     fun replacing(): Long = serials.incrementAndGet().also { engine.set(it) }
@@ -34,7 +36,7 @@ internal class VpnLifecycle(
         if (destroyed) return@synchronized
         if (stopping) {
             pending = id
-            emit("connecting", id)
+            emit("connecting", id, token)
         } else if (active != id) {
             if (active != null) {
                 pending = id
@@ -45,9 +47,9 @@ internal class VpnLifecycle(
 
     private fun startLocked(id: String) {
         active = id
-        token += 1
+        token = serials.incrementAndGet()
         val value = token
-        emit("connecting", id)
+        emit("connecting", id, token)
         submit(value) { connect(id, value) }
     }
 
@@ -63,23 +65,28 @@ internal class VpnLifecycle(
         if (clearPending) pending = null
         if (stopping) return
         stopping = true
-        token += 1
+        token = serials.incrementAndGet()
         engine.set(0)
+        val generation = token
         val old = active
         active = null
         jobs.forEach { it.cancel(true) }
         jobs.clear()
-        emit("disconnecting", old)
+        emit("disconnecting", old, generation)
         worker.submit {
+            var failed = false
             try {
                 cleanup()
+            } catch (error: Exception) {
+                failed = true
+                android.util.Log.e("fluxpeer-node", "Native cleanup failed", error)
             } finally {
                 synchronized(lock) {
                     stopping = false
-                    emit(state, old)
+                    emit(if (failed) "error" else state, old, generation)
                     val next = pending
                     pending = null
-                    if (!destroyed && next != null) startLocked(next) else idle()
+                    if (!failed && !destroyed && next != null) startLocked(next) else idle()
                 }
             }
         }
@@ -91,6 +98,6 @@ internal class VpnLifecycle(
         // Normal stop already cleaned up before stopSelf/onDestroy. A second
         // cleanup could otherwise stop a newly created service's native engine.
         if (active != null || stopping) stopLocked("disconnected", true)
-        worker.shutdown()
+        if (ownsWorker) worker.shutdown()
     }
 }

@@ -20,7 +20,7 @@ class VpnLifecycleTest {
         val lifecycle = VpnLifecycle(worker, { _, _ ->
             started.countDown()
             try { CountDownLatch(1).await() } catch (_: InterruptedException) { interrupted.countDown() }
-        }, { stopped.countDown() }, { _, _ -> }, {})
+        }, { stopped.countDown() }, { _, _, _ -> }, {})
         try {
             lifecycle.start("one"); started.ready()
             val start = System.nanoTime()
@@ -38,7 +38,7 @@ class VpnLifecycleTest {
         val worker = Executors.newSingleThreadExecutor()
         val lifecycle = VpnLifecycle(worker, { id, _ -> if(id=="two") second.countDown() }, {
             cleanupStarted.countDown(); releaseCleanup.await()
-        }, { state,id -> events.add("$state:$id") }, { events.add("idle") })
+        }, { state,id, _ -> events.add("$state:$id") }, { events.add("idle") })
         try {
             lifecycle.start("one"); lifecycle.stop(); cleanupStarted.ready()
             lifecycle.start("two")
@@ -53,7 +53,7 @@ class VpnLifecycleTest {
         val ready = CountDownLatch(1)
         val value = AtomicLong()
         val worker = Executors.newSingleThreadExecutor()
-        val lifecycle = VpnLifecycle(worker, { _, token -> value.set(token); ready.countDown() }, {}, { _, _ -> }, {})
+        val lifecycle = VpnLifecycle(worker, { _, token -> value.set(token); ready.countDown() }, {}, { _, _, _ -> }, {})
         try {
             lifecycle.start("one"); ready.ready()
             val old = lifecycle.replacing()
@@ -74,7 +74,7 @@ class VpnLifecycleTest {
         val events = CopyOnWriteArrayList<String>()
         val worker = Executors.newSingleThreadExecutor()
         val lifecycle = VpnLifecycle(worker, { _, _ -> ready.countDown() },
-            { events.add("cleanup") }, { state, _ -> events.add(state) }, { idle.countDown() })
+            { events.add("cleanup") }, { state, _, _ -> events.add(state) }, { idle.countDown() })
         try {
             lifecycle.start("one"); ready.ready()
             val serial = lifecycle.replacing()
@@ -90,7 +90,7 @@ class VpnLifecycleTest {
         val idle = CountDownLatch(1)
         val cleanups = AtomicLong()
         val worker = Executors.newSingleThreadExecutor()
-        val lifecycle = VpnLifecycle(worker, { _, _ -> }, { cleanups.incrementAndGet() }, { _, _ -> }, { idle.countDown() })
+        val lifecycle = VpnLifecycle(worker, { _, _ -> }, { cleanups.incrementAndGet() }, { _, _, _ -> }, { idle.countDown() })
         lifecycle.start("one"); lifecycle.stop(); idle.ready()
         lifecycle.destroy()
         assertTrue(worker.awaitTermination(2,TimeUnit.SECONDS))
@@ -105,7 +105,7 @@ class VpnLifecycleTest {
         val worker = Executors.newSingleThreadExecutor()
         val lifecycle = VpnLifecycle(worker, { _, _ ->
             retrying.countDown(); networkRestored.await(); connected.countDown()
-        }, {}, { _, _ -> }, { idle.countDown() })
+        }, {}, { _, _, _ -> }, { idle.countDown() })
         try {
             lifecycle.start("one"); retrying.ready()
             assertFalse(lifecycle.isIdle())

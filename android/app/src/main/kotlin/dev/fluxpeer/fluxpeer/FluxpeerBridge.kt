@@ -37,21 +37,23 @@ object FluxpeerBridge {
     }
 
     /** Update + broadcast a new snapshot (callable from any thread). */
-    fun emit(
+    @Synchronized fun emit(
         state: String,
         networkId: String? = snapshot["networkId"] as? String,
         overlayV4: String? = snapshot["overlayV4"] as? String,
         connectedAtMs: Long? = snapshot["connectedAtMs"] as? Long,
         peers: List<Map<String, Any?>> = emptyList(),
         warning: String? = null,
+        generation: Long = (snapshot["generation"] as? Long) ?: 0L,
     ) {
-        val snap = mutableMapOf<String, Any?>("state" to state, "peers" to peers)
+        if (generation < ((snapshot["generation"] as? Long) ?: 0L)) return
+        val snap = mutableMapOf<String, Any?>("state" to state, "peers" to peers, "generation" to generation)
         if (networkId != null) snap["networkId"] = networkId
         if (overlayV4 != null) snap["overlayV4"] = overlayV4
         if (connectedAtMs != null) snap["connectedAtMs"] = connectedAtMs
         if (!warning.isNullOrEmpty()) snap["warning"] = warning
         snapshot = snap
-        main.post { sink?.success(snap) }
+        main.post { if (snapshot === snap) sink?.success(snap) }
     }
 
     // ---- envelope parsing --------------------------------------------------
@@ -80,26 +82,82 @@ object FluxpeerBridge {
 
     private const val PREFS = "fluxpeer_networks"
 
-    fun saveNetwork(ctx: Context, networkId: String, record: JSONObject) {
-        ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            .edit().putString(networkId, record.toString()).apply()
+    private fun prefs(ctx: Context) = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+
+    /** Migrate only records whose complete identity is available; never guess by net id. */
+    @Synchronized private fun migrate(ctx: Context) {
+        val prefs = prefs(ctx)
+        val edit = prefs.edit()
+        var changed = false
+        val active = prefs.getString("__last_active", null)
+        for ((old, value) in prefs.all) {
+            if (old.startsWith("__") || old.startsWith("v2.") || value !is String) continue
+            val record = JSONObject(value)
+            val key = Membership.key(record)
+            check(!prefs.contains(key) || prefs.getString(key, null) == value) { "Conflicting legacy membership; rejoin required" }
+            edit.putString(key, value).remove(old)
+            if (active == old) edit.putString("__last_active", key)
+            changed = true
+        }
+        if (changed) check(edit.commit()) { "Membership migration could not be saved" }
     }
 
-    fun loadNetwork(ctx: Context, networkId: String): JSONObject? {
-        val raw = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(networkId, null)
-            ?: return null
-        return runCatching { JSONObject(raw) }.getOrNull()
+    @Synchronized fun saveNetwork(ctx: Context, networkId: String, record: JSONObject) {
+        migrate(ctx)
+        val key = Membership.key(record)
+        check(!FluxpeerVpnService.isLeaving(key)) { "Membership leave is in progress" }
+        require(networkId == key || networkId == record.optString("networkId")) { "Membership identity mismatch" }
+        check(prefs(ctx).edit().putString(key, record.toString()).commit()) { "Membership could not be saved" }
+    }
+
+    @Synchronized fun loadNetwork(ctx: Context, networkId: String): JSONObject? {
+        migrate(ctx)
+        require(networkId.startsWith("v2.")) { "Complete membership identity required" }
+        val raw = prefs(ctx).getString(networkId, null) ?: return null
+        val record = JSONObject(raw)
+        check(Membership.key(record) == networkId) { "Stored membership identity mismatch" }
+        return record
+    }
+
+    /** Called only after the matching native engine has stopped successfully. */
+    @Synchronized fun deleteNetwork(ctx: Context, key: String) {
+        migrate(ctx)
+        require(key.startsWith("v2.")) { "Complete membership identity required" }
+        val record = loadNetwork(ctx, key)
+        val cache = ctx.getSharedPreferences("fluxpeer_engine_configs", Context.MODE_PRIVATE)
+        val editCache = cache.edit()
+        for (storedKey in cache.all.keys) {
+            val parts = runCatching { JSONArray(storedKey) }.getOrNull() ?: continue
+            val cachedId = parts.optString(0)
+            // Remove every cache version for this member, including a rotated
+            // public key or equivalent control URL spelling, without touching
+            // another controller's legacy cache for the same server network id.
+            val matches = cachedId == key || (record != null && cachedId == record.optString("networkId") &&
+                runCatching { Membership.key(parts.getString(1), cachedId, parts.getString(2)) }.getOrNull() == key)
+            if (matches) editCache.remove(storedKey)
+        }
+        check(editCache.commit()) { "Engine configuration could not be removed" }
+        val prefs = prefs(ctx)
+        val wasActive = prefs.getString("__last_active", null) == key
+        if (wasActive) Watchdog.cancelAndWait(ctx)
+        val edit = prefs.edit().remove(key)
+        if (wasActive) edit.remove("__last_active")
+        check(edit.commit()) { "Membership credentials could not be removed" }
     }
 
     /** Engine cache has its own preferences and identity key; it never rewrites settings. */
     internal fun saveEngineConfig(ctx: Context, networkId: String, record: JSONObject, config: JSONObject) {
         ctx.getSharedPreferences("fluxpeer_engine_configs", Context.MODE_PRIVATE)
-            .edit().putString(engineConfigKey(networkId, record), config.toString()).apply()
+            .edit().putString(engineConfigKey(networkId, record), config.toString()).commit().also { check(it) { "Engine cache could not be saved" } }
     }
 
     internal fun loadEngineConfig(ctx: Context, networkId: String, record: JSONObject): JSONObject? {
-        val raw = ctx.getSharedPreferences("fluxpeer_engine_configs", Context.MODE_PRIVATE)
-            .getString(engineConfigKey(networkId, record), null) ?: return null
+        val cache = ctx.getSharedPreferences("fluxpeer_engine_configs", Context.MODE_PRIVATE)
+        val key = engineConfigKey(networkId, record)
+        val legacy = engineConfigKey(record.optString("networkId"), record)
+        val raw = cache.getString(key, null) ?: (if (networkId == Membership.key(record)) cache.getString(legacy, null) else null)?.also {
+            check(cache.edit().putString(key, it).remove(legacy).commit()) { "Engine cache migration could not be saved" }
+        } ?: return null
         return runCatching { JSONObject(raw) }.getOrNull()
     }
 
@@ -107,14 +165,19 @@ object FluxpeerBridge {
         JSONArray(listOf(networkId, record.optString("controlUrl"), record.optString("deviceId"), record.optString("pubkey"))).toString()
 
     /** The network last brought up — used by [BootReceiver] to reconnect on boot. */
-    fun saveLastActive(ctx: Context, networkId: String?) {
-        ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().apply {
-            if (networkId == null) remove("__last_active") else putString("__last_active", networkId)
-        }.apply()
+    @Synchronized fun saveLastActive(ctx: Context, networkId: String?) {
+        migrate(ctx)
+        if (networkId != null) check(loadNetwork(ctx, networkId) != null) { "Cannot reconnect a missing membership" }
+        val edit = prefs(ctx).edit()
+        if (networkId == null) edit.remove("__last_active") else edit.putString("__last_active", networkId)
+        check(edit.commit()) { "Reconnect preference could not be saved" }
     }
 
-    fun loadLastActive(ctx: Context): String? =
-        ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString("__last_active", null)
+    @Synchronized fun loadLastActive(ctx: Context): String? {
+        migrate(ctx)
+        val key = prefs(ctx).getString("__last_active", null) ?: return null
+        return key.takeIf { it.startsWith("v2.") && loadNetwork(ctx, it) != null }
+    }
 
     /** Build a Dart-facing `FxNetwork` map from a stored connect record. */
     fun networkToDart(record: JSONObject): Map<String, Any?> = mapOf(

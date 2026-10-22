@@ -11,10 +11,12 @@
 // propagates, regardless of the flag. This test runs with the default (flag
 // off) and feeds a PlatformException, so it holds independent of the flag.
 import 'package:flutter/services.dart';
+import 'package:fluxpeer/models/models.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:fluxpeer/channel/fluxpeer_channel.dart';
 
 void main() {
+  const enabled = bool.fromEnvironment('FLUXPEER_ALLOW_MOCK', defaultValue: false);
   TestWidgetsFlutterBinding.ensureInitialized();
   const channel = MethodChannel('dev.fluxpeer.app/flux');
   final messenger =
@@ -56,4 +58,25 @@ void main() {
       expect(FluxpeerChannel.usingMock, isFalse);
     },
   );
+  test('all missing native entrypoints reject fallback without explicit debug opt-in', () async {
+    const network = FxNetwork(id: 'net-1', name: 'test', controlUrl: 'https://test.invalid', deviceId: 'dev-1');
+    messenger.setMockMethodCallHandler(channel, (call) async => throw MissingPluginException());
+    for (final call in <Future<dynamic> Function()>[
+      () => FluxpeerChannel.join('invite', 'device'),
+      () => FluxpeerChannel.startTunnel(network), FluxpeerChannel.stopTunnel,
+      () => FluxpeerChannel.leave(network), FluxpeerChannel.getCurrentState,
+      FluxpeerChannel.permissionStatus, FluxpeerChannel.requestVpn,
+      FluxpeerChannel.requestBatteryExemption, FluxpeerChannel.requestNotifications,
+      FluxpeerChannel.openAutoStart,
+    ]) {
+      await expectLater(call(), throwsA(isA<MissingPluginException>()));
+      expect(FluxpeerChannel.usingMock, isFalse);
+    }
+  }, skip: enabled);
+  test('debug opt-in can explicitly use the missing native mock', () async {
+    messenger.setMockMethodCallHandler(channel, (call) async => throw MissingPluginException());
+    await FluxpeerChannel.getCurrentState();
+    expect(FluxpeerChannel.usingMock, isTrue);
+  }, skip: !enabled);
+
 }

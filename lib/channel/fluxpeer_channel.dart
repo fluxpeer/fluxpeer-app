@@ -3,28 +3,30 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/services.dart';
+import 'package:flutter/foundation.dart';
+import 'debug_mock.dart';
 
 import '../models/models.dart';
 
 /// Bridge to the native tunnel host — iOS NetworkExtension (PacketTunnelProvider)
 /// / Android VpnService — which runs the fluxpeer node IN-PROCESS over FFI.
 ///
-/// A built-in MOCK backend exists for UI-only development, but production/QA
+/// A built-in MOCK backend exists for UI-only development, but debug
 /// builds must opt in explicitly with `--dart-define=FLUXPEER_ALLOW_MOCK=true`.
 class FluxpeerChannel {
   FluxpeerChannel._();
 
   static const MethodChannel _m = MethodChannel('dev.fluxpeer.app/flux');
   static const EventChannel _e = EventChannel('dev.fluxpeer.app/fluxStatus');
-  static const bool _allowMock = bool.fromEnvironment(
+  static const bool _allowMock = kDebugMode && bool.fromEnvironment(
     'FLUXPEER_ALLOW_MOCK',
     defaultValue: false,
   );
 
-  static final _MockBackend _mock = _MockBackend();
+  static final DebugMockBackend _mock = DebugMockBackend();
   static bool _useMock = false;
 
-  static bool get usingMock => _useMock;
+  static bool get usingMock => _allowMock && _useMock;
 
   /// Enroll a join token (scan / paste / import) → returns the joined network.
   /// Wraps the FFI `join`: keygen + enroll-once + persist config natively.
@@ -36,15 +38,18 @@ class FluxpeerChannel {
       });
       return FxNetwork.fromJson(Map<String, dynamic>.from(r as Map));
     } on MissingPluginException {
+      if (!_allowMock) rethrow;
       _useMock = true;
       return _mock.join(token, deviceName);
     }
   }
 
   static Future<void> startTunnel(FxNetwork net) async {
+    if (net.needsRejoin) throw StateError('Rejoin this network before connecting');
     try {
       await _m.invokeMethod('start', {'network': jsonEncode(net.toJson())});
     } on MissingPluginException {
+      if (!_allowMock) rethrow;
       _useMock = true;
       await _mock.start(net);
     }
@@ -54,8 +59,19 @@ class FluxpeerChannel {
     try {
       await _m.invokeMethod('stop');
     } on MissingPluginException {
+      if (!_allowMock) rethrow;
       _useMock = true;
       await _mock.stop();
+    }
+  }
+
+  static Future<void> leave(FxNetwork net) async {
+    try {
+      await _m.invokeMethod('leave', {'network': jsonEncode(net.toJson())});
+    } on MissingPluginException {
+      if (!_allowMock) rethrow;
+      _useMock = true;
+      if (_mock.current.networkId == net.key) await _mock.stop();
     }
   }
 
@@ -100,14 +116,15 @@ class FluxpeerChannel {
   static Future<void> _grant(String method) async {
     try {
       await _m.invokeMethod(method);
-    } catch (_) {
-      /* mock / unsupported — no-op */
+    } on MissingPluginException {
+      if (!_allowMock) rethrow;
+      _useMock = true;
     }
   }
 
   /// Real-time status stream from the tunnel host.
   static Stream<FxStateSnapshot> statusStream() {
-    if (_useMock) return _mock.stream;
+    if (_allowMock && _useMock) return _mock.stream;
     try {
       return _e.receiveBroadcastStream().map(
         (e) => FxStateSnapshot.fromJson(Map<String, dynamic>.from(e as Map)),
@@ -117,93 +134,5 @@ class FluxpeerChannel {
       _useMock = true;
       return _mock.stream;
     }
-  }
-}
-
-/// In-memory mock of the tunnel host so the UI runs without native code.
-class _MockBackend {
-  final StreamController<FxStateSnapshot> _ctrl =
-      StreamController<FxStateSnapshot>.broadcast();
-  FxStateSnapshot current = const FxStateSnapshot();
-  bool _authorized = false;
-
-  Stream<FxStateSnapshot> get stream => _ctrl.stream;
-
-  Future<FxNetwork> join(String token, String device) async {
-    await Future<void>.delayed(const Duration(milliseconds: 600));
-    final ts = DateTime.now().millisecondsSinceEpoch;
-    return FxNetwork(
-      id: 'mock-$ts',
-      name: 'home-net',
-      controlUrl: 'https://demo.fluxpeer.dev',
-      overlayV4: '100.72.16.5',
-      deviceId: 'dev-${device.isEmpty ? 'mock' : device}',
-      pubkey: 'mock+pubkey+${ts.toRadixString(36)}',
-    );
-  }
-
-  Future<void> start(FxNetwork net) async {
-    // First connect ever simulates the OS VPN-permission grant.
-    if (!_authorized) {
-      current = FxStateSnapshot(
-        state: FxConnState.authorizing,
-        networkId: net.id,
-      );
-      _ctrl.add(current);
-      await Future<void>.delayed(const Duration(milliseconds: 900));
-      _authorized = true;
-    }
-    current = FxStateSnapshot(state: FxConnState.connecting, networkId: net.id);
-    _ctrl.add(current);
-    await Future<void>.delayed(const Duration(milliseconds: 1100));
-    current = FxStateSnapshot(
-      state: FxConnState.connected,
-      networkId: net.id,
-      overlayV4: net.overlayV4,
-      connectedAtMs: DateTime.now().millisecondsSinceEpoch,
-      peers: _mockPeers(),
-    );
-    _ctrl.add(current);
-  }
-
-  Future<void> stop() async {
-    current = const FxStateSnapshot(state: FxConnState.disconnected);
-    _ctrl.add(current);
-  }
-
-  List<FxPeer> _mockPeers() {
-    final now = DateTime.now().millisecondsSinceEpoch;
-    return [
-      FxPeer(
-        name: 'laptop',
-        pubkey: 'pk-laptop',
-        endpoint: '203.0.113.7:41820',
-        transport: FxTransport.udpDirect,
-        rttMs: 12,
-        rxBytes: 2300000,
-        txBytes: 1100000,
-        lastHandshakeMs: now - 23000,
-      ),
-      FxPeer(
-        name: 'phone',
-        pubkey: 'pk-phone',
-        endpoint: 'relay',
-        transport: FxTransport.relay,
-        rttMs: 38,
-        rxBytes: 420000,
-        txBytes: 510000,
-        lastHandshakeMs: now - 95000,
-      ),
-      FxPeer(
-        name: 'nas',
-        pubkey: 'pk-nas',
-        endpoint: '198.51.100.4:41820',
-        transport: FxTransport.udpDirect,
-        rttMs: 4,
-        rxBytes: 9800000,
-        txBytes: 230000,
-        lastHandshakeMs: now - 4000,
-      ),
-    ];
   }
 }

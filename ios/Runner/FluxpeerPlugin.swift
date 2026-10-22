@@ -17,6 +17,7 @@ final class FluxpeerPlugin: NSObject, FlutterStreamHandler {
     static let extensionBundleId = "dev.fluxpeer.fluxpeer.PacketTunnel"
     static let appGroup = "group.dev.fluxpeer.fluxpeer"
 
+    private var operationPending = false
     private var manager: NETunnelProviderManager?
     private var sink: FlutterEventSink?
     private var snapshot: [String: Any] = ["state": "disconnected", "peers": []]
@@ -37,7 +38,21 @@ final class FluxpeerPlugin: NSObject, FlutterStreamHandler {
     // MARK: - MethodChannel
 
     private func handle(_ call: FlutterMethodCall, _ result: @escaping FlutterResult) {
+        let mutating = ["join", "start", "leave", "stop"].contains(call.method)
+        if mutating && operationPending { result(FlutterError(code: "busy", message: "Native operation pending", details: nil)); return }
+        if mutating { operationPending = true }
+        let complete: FlutterResult = { value in
+            DispatchQueue.main.async {
+                if mutating { self.operationPending = false }
+                result(value)
+            }
+        }
+        handleOperation(call, complete)
+    }
+
+    private func handleOperation(_ call: FlutterMethodCall, _ result: @escaping FlutterResult) {
         switch call.method {
+        case "leave": leave(call.arguments as? [String: Any] ?? [:], result)
         case "join": join(call.arguments as? [String: Any] ?? [:], result)
         case "start": start(call.arguments as? [String: Any] ?? [:], result)
         case "stop": manager?.connection.stopVPNTunnel(); result(nil)
@@ -71,7 +86,7 @@ final class FluxpeerPlugin: NSObject, FlutterStreamHandler {
 
                 let networkId = (dev["network_id"] as? String).flatMap { $0.isEmpty ? nil : $0 }
                     ?? (dev["id"] as? String ?? "")
-                var record: [String: Any] = [
+                let record: [String: Any] = [
                     "networkId": networkId,
                     "name": device,
                     "controlUrl": dev["control_server"] as? String ?? "",
@@ -84,7 +99,7 @@ final class FluxpeerPlugin: NSObject, FlutterStreamHandler {
                     "crypto_protocol": "noise",
                     "mtu": 1380,
                 ]
-                self.saveRecord(networkId, record)
+                try self.saveRecord(networkId, record)
                 DispatchQueue.main.async { result(self.toDart(record)) }
             } catch {
                 DispatchQueue.main.async { result(FlutterError(code: "join_failed", message: "\(error)", details: nil)) }
@@ -94,12 +109,16 @@ final class FluxpeerPlugin: NSObject, FlutterStreamHandler {
 
     /// Resolve the gateway, fold node_* into the record, then save + start the tunnel.
     private func start(_ args: [String: Any], _ result: @escaping FlutterResult) {
-        guard let netJson = args["network"] as? String,
-              let netData = netJson.data(using: .utf8),
-              let net = (try? JSONSerialization.jsonObject(with: netData)) as? [String: Any],
-              let networkId = net["id"] as? String, !networkId.isEmpty,
-              var record = loadRecord(networkId)
-        else { return result(FlutterError(code: "bad_args", message: "unknown network", details: nil)) }
+        let net: [String: Any]
+        var record: [String: Any]
+        let networkId: String
+        do {
+            net = try networkArgument(args)
+            guard net["needsRejoin"] as? Bool != true else { throw MembershipStore.failure("Rejoin this network before connecting") }
+            networkId = try MembershipStore.key(net)
+            guard let saved = try loadRecord(networkId) else { throw MembershipStore.failure("Rejoin this network before connecting") }
+            record = saved
+        } catch { result(FlutterError(code: "start_failed", message: "\(error)", details: nil)); return }
 
         let userTransport = (net["user_transport"] as? String) ?? ""
 
@@ -111,13 +130,81 @@ final class FluxpeerPlugin: NSObject, FlutterStreamHandler {
             // extension hands the record straight to the FFI, which reads
             // `transport_protocol`. Empty userTransport = 'auto' → keep default.
             if !userTransport.isEmpty { record["transport_protocol"] = userTransport }
-            self.saveRecord(networkId, record)
+            do { try self.saveRecord(networkId, record) }
+            catch {
+                DispatchQueue.main.async { result(FlutterError(code: "save_failed", message: "\(error)", details: nil)) }
+                return
+            }
             guard !(record["node_addr"] as? String ?? "").isEmpty else {
                 DispatchQueue.main.async { result(FlutterError(code: "no_gateway", message: "no reachable gateway yet", details: nil)) }
                 return
             }
             DispatchQueue.main.async { self.installAndStart(record, result) }
         }
+    }
+
+    private func networkArgument(_ args: [String: Any]) throws -> [String: Any] {
+        guard let raw = args["network"] as? String, let data = raw.data(using: .utf8),
+              let net = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { throw MembershipStore.failure("Missing network identity") }
+        return net
+    }
+
+    /// Keep UI membership until the matching extension has stopped and its saved
+    /// profile (including credentials in providerConfiguration) has been removed.
+    private func leave(_ args: [String: Any], _ result: @escaping FlutterResult) {
+        let key: String
+        do { key = try MembershipStore.key(networkArgument(args)); try MembershipStore(defaults: store).migrate() }
+        catch { result(FlutterError(code: "leave_failed", message: "\(error)", details: nil)); return }
+        NETunnelProviderManager.loadAllFromPreferences { managers, error in
+            if let error { result(FlutterError(code: "leave_failed", message: "\(error)", details: nil)); return }
+            DispatchQueue.main.async {
+                do {
+                    let matching = try (managers ?? []).filter { manager in
+                        guard let proto = manager.protocolConfiguration as? NETunnelProviderProtocol,
+                              proto.providerBundleIdentifier == Self.extensionBundleId,
+                              let raw = proto.providerConfiguration?["flux_config"] as? String else { return false }
+                        return try MembershipStore.key(self.networkArgument(["network": raw])) == key
+                    }
+                    self.removeProfiles(matching, key: key, result: result)
+                } catch { result(FlutterError(code: "leave_failed", message: "\(error)", details: nil)) }
+            }
+        }
+    }
+
+    private func removeProfiles(_ profiles: [NETunnelProviderManager], key: String, result: @escaping FlutterResult) {
+        guard let profile = profiles.first else {
+            do { try MembershipStore(defaults: store).remove(key); result(nil) }
+            catch { result(FlutterError(code: "leave_failed", message: "\(error)", details: nil)) }
+            return
+        }
+        profile.isOnDemandEnabled = false
+        profile.saveToPreferences { error in
+            if let error { result(FlutterError(code: "leave_failed", message: "\(error)", details: nil)); return }
+            DispatchQueue.main.async {
+                profile.connection.stopVPNTunnel()
+                self.waitForStop(profile, deadline: Date().addingTimeInterval(10)) { error in
+                    if let error { result(FlutterError(code: "leave_failed", message: "\(error)", details: nil)); return }
+                    profile.removeFromPreferences { error in
+                        DispatchQueue.main.async {
+                            if let error { result(FlutterError(code: "leave_failed", message: "\(error)", details: nil)); return }
+                            if self.managerKey() == key || self.snapshot["networkId"] as? String == key {
+                                self.manager = nil
+                                self.snapshot = ["state": "disconnected", "peers": []]
+                                self.sink?(self.snapshot)
+                            }
+                            self.removeProfiles(Array(profiles.dropFirst()), key: key, result: result)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func waitForStop(_ profile: NETunnelProviderManager, deadline: Date, complete: @escaping (Error?) -> Void) {
+        if [.disconnected, .invalid].contains(profile.connection.status) { complete(nil); return }
+        if Date() >= deadline { complete(MembershipStore.failure("Tunnel stop timed out; membership retained")); return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { self.waitForStop(profile, deadline: deadline, complete: complete) }
     }
 
     private func resolveGateway(_ record: inout [String: Any]) {
@@ -192,9 +279,16 @@ final class FluxpeerPlugin: NSObject, FlutterStreamHandler {
 
     private func loadManager() {
         NETunnelProviderManager.loadAllFromPreferences { [weak self] managers, _ in
-            self?.manager = managers?.first
+            self?.manager = managers?.first { ($0.protocolConfiguration as? NETunnelProviderProtocol)?.providerBundleIdentifier == Self.extensionBundleId }
             self?.statusChanged()
         }
+    }
+
+    private func managerKey() -> String? {
+        guard let proto = manager?.protocolConfiguration as? NETunnelProviderProtocol,
+              let raw = proto.providerConfiguration?["flux_config"] as? String,
+              let record = try? networkArgument(["network": raw]) else { return nil }
+        return try? MembershipStore.key(record)
     }
 
     @objc private func statusChanged() {
@@ -206,6 +300,9 @@ final class FluxpeerPlugin: NSObject, FlutterStreamHandler {
         default: state = "disconnected"
         }
         var snap: [String: Any] = ["state": state, "peers": []]
+        if let proto = manager?.protocolConfiguration as? NETunnelProviderProtocol,
+           let raw = proto.providerConfiguration?["flux_config"] as? String,
+           let record = try? networkArgument(["network": raw]), let key = try? MembershipStore.key(record) { snap["networkId"] = key }
         if state == "connected" { snap["connectedAtMs"] = Int(Date().timeIntervalSince1970 * 1000) }
         snapshot = snap
         DispatchQueue.main.async { self.sink?(snap) }
@@ -220,12 +317,11 @@ final class FluxpeerPlugin: NSObject, FlutterStreamHandler {
 
     // MARK: - persistence + helpers
 
-    private func saveRecord(_ id: String, _ record: [String: Any]) {
-        store.set(json(record), forKey: "network.\(id)")
+    private func saveRecord(_ id: String, _ record: [String: Any]) throws {
+        try MembershipStore(defaults: store).save(record)
     }
-    private func loadRecord(_ id: String) -> [String: Any]? {
-        guard let s = store.string(forKey: "network.\(id)"), let d = s.data(using: .utf8) else { return nil }
-        return (try? JSONSerialization.jsonObject(with: d)) as? [String: Any]
+    private func loadRecord(_ id: String) throws -> [String: Any]? {
+        try MembershipStore(defaults: store).load(id)
     }
 
     private func json(_ obj: [String: Any]) -> String {

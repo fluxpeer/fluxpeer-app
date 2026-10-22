@@ -47,24 +47,25 @@ class NetworksTab extends StatelessWidget {
           separatorBuilder: (_, _) => const SizedBox(height: FxSpace.x2),
           itemBuilder: (_, i) {
             final n = c.networks[i];
-            final active = n.id == c.activeId.value;
+            final active = n.key == c.activeId.value;
             return Card(
               child: ListTile(
                 leading: Icon(Icons.hub_outlined,
                     color: active ? Fx.brandGlow : Fx.fgMuted),
                 title: Text(n.name, style: FxText.body),
-                subtitle: Text(n.overlayV4 ?? n.controlUrl,
+                subtitle: Text(n.needsRejoin ? 'Rejoin required after restore' : n.overlayV4 ?? n.controlUrl,
                     style: FxText.monoMuted),
                 trailing: PopupMenuButton<String>(
                   color: Fx.bgElevated,
                   tooltip: 'settings.title'.tr,
-                  onSelected: (v) {
+                  onSelected: (v) async {
                     if (v == 'settings') {
                       Get.to(() => SettingsPage(n));
                     } else if (v == 'rename') {
-                      _renameDialog(context, c, n.id, n.name);
+                      _renameDialog(context, c, n.key, n.name);
                     } else if (v == 'leave') {
-                      c.leave(n.id);
+                      try { await c.leave(n.key); }
+                      catch (error) { Get.snackbar('fluxpeer', 'Leave failed: $error'); }
                     }
                   },
                   itemBuilder: (_) => [
@@ -82,7 +83,7 @@ class NetworksTab extends StatelessWidget {
                             style: TextStyle(color: Fx.danger))),
                   ],
                 ),
-                onTap: () => c.switchTo(n.id),
+                onTap: () => c.switchTo(n.key),
               ),
             );
           },

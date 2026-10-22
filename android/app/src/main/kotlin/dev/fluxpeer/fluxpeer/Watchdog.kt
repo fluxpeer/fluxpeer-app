@@ -42,6 +42,11 @@ object Watchdog {
             .enqueueUniquePeriodicWork(NAME, ExistingPeriodicWorkPolicy.KEEP, req)
     }
 
+    /** Leave runs on the engine worker and must observe cancellation failures. */
+    fun cancelAndWait(ctx: Context) {
+        WorkManager.getInstance(ctx).cancelUniqueWork(NAME).result.get()
+    }
+
     fun cancel(ctx: Context) {
         WorkManager.getInstance(ctx).cancelUniqueWork(NAME)
     }

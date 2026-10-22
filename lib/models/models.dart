@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
+import 'dart:convert';
+
 /// Connection lifecycle state driving the ConnectRing + tunnel.
 enum FxConnState {
   disconnected,
@@ -27,6 +29,7 @@ class FxNetwork {
   final String id;
   final String name;
   final String controlUrl;
+  final bool needsRejoin;
   final String? overlayV4;
   final String? deviceId;
   final String? pubkey;
@@ -45,6 +48,7 @@ class FxNetwork {
     required this.id,
     required this.name,
     required this.controlUrl,
+    this.needsRejoin = false,
     this.overlayV4,
     this.deviceId,
     this.pubkey,
@@ -55,6 +59,16 @@ class FxNetwork {
     this.excludeRoutes = const [],
     this.transportProtocol = 'auto',
   });
+
+  /// Origin + server network id + enrolled device id is the local identity.
+  String get key => membershipKey(controlUrl, id, deviceId ?? '');
+
+  Map<String, dynamic> toBackup() => {
+    'id': id, 'name': name, 'controlUrl': controlUrl, 'deviceId': deviceId,
+    'mtu': mtu, 'mtuExplicit': mtuExplicit, 'dns': dns, 'exitNode': exitNode,
+    'excludeRoutes': excludeRoutes, 'transportProtocol': transportProtocol,
+    'needsRejoin': true,
+  };
 
   FxNetwork copyWith({
     String? name,
@@ -70,6 +84,7 @@ class FxNetwork {
         id: id,
         name: name ?? this.name,
         controlUrl: controlUrl,
+        needsRejoin: needsRejoin,
         overlayV4: overlayV4 ?? this.overlayV4,
         deviceId: deviceId,
         pubkey: pubkey,
@@ -86,6 +101,7 @@ class FxNetwork {
       'id': id,
       'name': name,
       'controlUrl': controlUrl,
+      'needsRejoin': needsRejoin,
       'overlayV4': overlayV4,
       'deviceId': deviceId,
       'pubkey': pubkey,
@@ -106,6 +122,7 @@ class FxNetwork {
         id: j['id'] as String,
         name: j['name'] as String? ?? 'network',
         controlUrl: j['controlUrl'] as String? ?? '',
+        needsRejoin: j['needsRejoin'] as bool? ?? false,
         overlayV4: j['overlayV4'] as String?,
         deviceId: j['deviceId'] as String?,
         pubkey: j['pubkey'] as String?,
@@ -183,4 +200,13 @@ class FxStateSnapshot {
                 .toList() ??
             const [],
       );
+}
+
+String membershipKey(String control, String network, String device) {
+  final uri = Uri.parse(control);
+  if (network.isEmpty || !['http', 'https'].contains(uri.scheme) || uri.host.isEmpty || uri.userInfo.isNotEmpty) {
+    throw const FormatException('Invalid control origin');
+  }
+  final origin = uri.origin.toLowerCase();
+  return 'v2.${[origin, network, device].map((part) => base64Url.encode(utf8.encode(part)).replaceAll('=', '')).join('.')}';
 }

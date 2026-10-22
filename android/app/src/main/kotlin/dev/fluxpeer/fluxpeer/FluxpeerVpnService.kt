@@ -15,15 +15,22 @@ import java.util.concurrent.Executors
 /** UID bypass follows the system default network; route policy comes only from the engine. */
 class FluxpeerVpnService : VpnService() {
     private val main = android.os.Handler(android.os.Looper.getMainLooper())
-    private val worker = Executors.newSingleThreadExecutor()
+    private val worker = engineWorker
+    internal var engine: NodeBackend = SystemNodeBackend
+    internal var establish: ((AndroidNodeConfig.TunPlan) -> ParcelFileDescriptor)? = null
+    internal var scheduleWatchdog: () -> Unit = { Watchdog.schedule(this) }
     private val lifecycle: VpnLifecycle = VpnLifecycle(worker, ::connect, ::cleanup,
-        { state, id -> FluxpeerBridge.emit(state, networkId = id) },
-        { main.post { if (lifecycleIdle()) { running = false; stopForeground(STOP_FOREGROUND_REMOVE); stopSelf() } } },
+        { state, id, generation ->
+            if (activeService == null || activeService === this) FluxpeerBridge.emit(state, networkId = id, generation = generation)
+        },
+        { main.post { if (lifecycleIdle()) { if (activeService === this) running = false; stopForeground(STOP_FOREGROUND_REMOVE); stopSelf() } } },
+        ownsWorker = false,
     )
     private fun lifecycleIdle(): Boolean = lifecycle.isIdle()
     @Volatile private var networkId: String? = null
     @Volatile private var token = 0L
     private var record: JSONObject? = null
+    private var appliedPlan: AndroidNodeConfig.TunPlan? = null
     private var installed: AndroidNodeConfig.TunPlan? = null
     private val tunFdLock = Any()
     private var detachedTunFd = -1
@@ -31,6 +38,27 @@ class FluxpeerVpnService : VpnService() {
     private var wakeLock: PowerManager.WakeLock? = null
 
     companion object {
+        private val engineWorker = Executors.newSingleThreadExecutor { work -> Thread(work, "fluxpeer-vpn").apply { isDaemon = true } }
+        @Volatile private var activeService: FluxpeerVpnService? = null
+        private var engineOwner: FluxpeerVpnService? = null // accessed only by engineWorker
+        private val leaving = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+        internal fun isLeaving(id: String): Boolean = leaving.contains(id)
+        internal fun drain() = engineWorker.submit {}
+        fun leave(context: android.content.Context, id: String, completed: (Exception?) -> Unit) {
+            if (!leaving.add(id)) { completed(IllegalStateException("Membership leave already pending")); return }
+            activeService?.takeIf { it.lifecycle.references(id) }?.lifecycle?.stop()
+            val app = context.applicationContext
+            engineWorker.submit {
+                val failure = try {
+                    engineOwner?.takeIf { it.networkId == id }?.cleanup()
+                    FluxpeerBridge.deleteNetwork(app, id)
+                    null
+                } catch (error: Exception) { error }
+                leaving.remove(id)
+                completed(failure)
+            }
+        }
+
         const val ACTION_START = "dev.fluxpeer.START"
         const val ACTION_STOP = "dev.fluxpeer.STOP"
         const val EXTRA_NETWORK_ID = "networkId"
@@ -48,14 +76,17 @@ class FluxpeerVpnService : VpnService() {
             return START_NOT_STICKY
         }
         val id = intent?.getStringExtra(EXTRA_NETWORK_ID)
+        if (id != null && isLeaving(id)) return START_NOT_STICKY
         if (id == null) {
             FluxpeerBridge.emit("error")
             lifecycle.stop("error")
             return START_NOT_STICKY
         }
+        activeService?.takeIf { it !== this }?.lifecycle?.stop()
+        activeService = this
         running = true
         startForeground(NOTIFY_ID, notification("Connecting…"))
-        Watchdog.schedule(this)
+        scheduleWatchdog()
         lifecycle.start(id)
         return START_REDELIVER_INTENT
     }
@@ -92,10 +123,7 @@ class FluxpeerVpnService : VpnService() {
                     return@submit // wait for the replacement engine to confirm its applied state
                 }
                 if (!lifecycle.current(value)) return@submit
-                val message = plan.warnings.joinToString("; ")
-                updateNotification(message.ifEmpty { "Connected — ${plan.addressV4}" })
-                FluxpeerBridge.emit(if (rec.optBoolean("exitNode") && !plan.fullTunnel) "connecting" else "connected",
-                    networkId = networkId, overlayV4 = plan.addressV4, connectedAtMs = System.currentTimeMillis(), warning = message)
+                appliedPlan = plan
             } catch (e: Exception) {
                 android.util.Log.e("fluxpeer-node", "Engine route apply failed", e)
                 if (lifecycle.current(value)) lifecycle.stop("error")
@@ -103,19 +131,39 @@ class FluxpeerVpnService : VpnService() {
         }
     }
 
+    /** Explicit readiness follows successful control/config apply and TUN creation. */
+    fun onReady(serial: Long) {
+        val value = token
+        lifecycle.submit(value) {
+            if (!lifecycle.accepts(serial)) return@submit
+            val plan = appliedPlan ?: return@submit
+            val rec = record ?: return@submit
+            val message = plan.warnings.joinToString("; ")
+            updateNotification(message.ifEmpty { "Connected — ${plan.addressV4}" })
+            FluxpeerBridge.emit(if (rec.optBoolean("exitNode") && !plan.fullTunnel) "connecting" else "connected",
+                networkId = networkId, overlayV4 = plan.addressV4, connectedAtMs = System.currentTimeMillis(),
+                warning = message, generation = value)
+        }
+    }
+
     private fun install(plan: AndroidNodeConfig.TunPlan, cfg: JSONObject, value: Long) {
         lifecycle.replacing() // fence callbacks BEFORE establish can close the old TUN
-        val pfd = buildTun(plan)
+        appliedPlan = null
+        FluxpeerBridge.emit("connecting", networkId = networkId, generation = value)
+        engineOwner?.cleanup()
+        if (!lifecycle.current(value)) return
+        val pfd = establish?.invoke(plan) ?: buildTun(plan)
         try {
-            FluxpeerNode.stopNode()
             if (!lifecycle.current(value)) return
-            FluxpeerNode.vpn = this
+            engineOwner = this
+            engine.bind(this)
             val fd = pfd.detachFd()
             setPendingTunFd(fd)
-            val result = JSONObject(FluxpeerNode.runNode(cfg.toString(), fd, lifecycle.serial()))
+            val result = JSONObject(engine.run(cfg.toString(), fd, lifecycle.serial()))
             check(result.optBoolean("ok", false)) { result.optString("error", "Native engine start failed") }
             markTunFdOwnedByEngine()
             installed = plan
+            acquireWakeLock()
         } finally {
             pfd.close()
             closePendingTunFd()
@@ -175,16 +223,19 @@ class FluxpeerVpnService : VpnService() {
     }
 
     private fun cleanup() {
-        FluxpeerNode.stopNode()
-        FluxpeerNode.vpn = null
+        if (engineOwner === this) {
+            engine.stop()
+            engine.bind(null)
+            engineOwner = null
+        }
         closePendingTunFd()
         releaseWakeLock()
         installed = null
-        record = null
+        appliedPlan = null
     }
 
     override fun onDestroy() {
-        running = false
+        if (activeService === this) { activeService = null; running = false }
         lifecycle.destroy()
         super.onDestroy()
     }
@@ -240,4 +291,15 @@ internal fun configureTun(builder: VpnService.Builder, plan: AndroidNodeConfig.T
     if (Build.VERSION.SDK_INT >= 33) {
         plan.excludes.forEach { builder.excludeRoute(android.net.IpPrefix(java.net.InetAddress.getByName(it.address), it.length)) }
     }
+}
+
+internal interface NodeBackend {
+    fun bind(service: FluxpeerVpnService?)
+    fun run(config: String, fd: Int, generation: Long): String
+    fun stop()
+}
+internal object SystemNodeBackend : NodeBackend {
+    override fun bind(service: FluxpeerVpnService?) { FluxpeerNode.vpn = service }
+    override fun run(config: String, fd: Int, generation: Long): String = FluxpeerNode.runNode(config, fd, generation)
+    override fun stop() { FluxpeerNode.stopNode() }
 }

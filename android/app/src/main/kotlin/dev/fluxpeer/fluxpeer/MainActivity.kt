@@ -40,6 +40,7 @@ class MainActivity : FlutterActivity() {
             when (call.method) {
                 "join" -> onJoin(call, result)
                 "start" -> onStart(call, result)
+                "leave" -> onLeave(call, result)
                 "stop" -> onStop(result)
                 "getCurrentState" -> result.success(FluxpeerBridge.snapshot)
                 // Keepalive / permissions (Me-tab system settings; background survival).
@@ -113,28 +114,23 @@ class MainActivity : FlutterActivity() {
     private fun onStart(call: MethodCall, result: MethodChannel.Result) {
         val networkJson = call.argument<String>("network").orEmpty()
         val passed = runCatching { JSONObject(networkJson) }.getOrNull()
-        val networkId = passed?.optString("id")
-        if (networkId.isNullOrEmpty()) {
-            result.error("bad_args", "start: missing network id", null)
+        val networkId: String
+        try {
+            check(passed != null && !passed.optBoolean("needsRejoin", false)) { "Rejoin this network before connecting" }
+            networkId = Membership.key(passed)
+            val rec = FluxpeerBridge.loadNetwork(this, networkId) ?: error("Rejoin this network before connecting")
+            rec.put("user_transport", passed.optString("user_transport").orEmpty())
+            rec.put("exitNode", passed.optBoolean("exitNode", false))
+            rec.put("mtuExplicit", passed.optBoolean("mtuExplicit", false))
+            if (passed.optBoolean("mtuExplicit", false)) rec.put("mtu", passed.getInt("mtu")) else rec.remove("mtu")
+            passed.optJSONArray("dns")?.let { rec.put("dns", it) }
+            passed.optJSONArray("excludeRoutes")?.let { rec.put("excludeRoutes", it) }
+            FluxpeerBridge.saveNetwork(this, networkId, rec)
+        } catch (error: Exception) {
+            result.error("start_failed", error.message, null)
             return
         }
-        // Fold the user-editable settings from the Dart record into the native
-        // record so a connect honors the LATEST in-app settings, not the values
-        // captured at join. Without this the exit-node (full-tunnel) toggle, DNS,
-        // MTU and exclude-routes edits never reach the VpnService.
-        runCatching {
-            FluxpeerBridge.loadNetwork(this, networkId)?.let { rec ->
-                rec.put("user_transport", passed.optString("user_transport").orEmpty())
-                passed.let { p ->
-                    rec.put("exitNode", p.optBoolean("exitNode", rec.optBoolean("exitNode", false)))
-                    rec.put("mtuExplicit", p.optBoolean("mtuExplicit", false))
-                    if (p.optBoolean("mtuExplicit", false)) rec.put("mtu", p.getInt("mtu")) else rec.remove("mtu")
-                    p.optJSONArray("dns")?.let { rec.put("dns", it) }
-                    p.optJSONArray("excludeRoutes")?.let { rec.put("excludeRoutes", it) }
-                }
-                FluxpeerBridge.saveNetwork(this, networkId, rec)
-            }
-        }
+        if (pendingResult != null) { result.error("busy", "VPN permission request already pending", null); return }
 
         val consent = VpnService.prepare(this)
         if (consent != null) {
@@ -146,6 +142,21 @@ class MainActivity : FlutterActivity() {
         }
         launchService(networkId)
         result.success(null)
+    }
+
+    private fun onLeave(call: MethodCall, result: MethodChannel.Result) {
+        val key = try { Membership.key(JSONObject(call.argument<String>("network").orEmpty())) }
+        catch (error: Exception) { result.error("bad_args", error.message, null); return }
+        if (pendingStartNetworkId == key) {
+            pendingStartNetworkId = null
+            pendingResult?.error("cancelled", "Membership left before VPN permission completed", null)
+            pendingResult = null
+        }
+        FluxpeerVpnService.leave(this, key) { error ->
+            main.post {
+                if (error == null) result.success(null) else result.error("leave_failed", error.message, null)
+            }
+        }
     }
 
     /** Trigger the VPN-consent dialog from the settings UI (not tied to a start). */

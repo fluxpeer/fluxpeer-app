@@ -117,6 +117,7 @@ class MeTab extends StatelessWidget {
         content: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
+            const Text('Display settings only. Rejoin each network after restoring.'),
             Container(
               padding: const EdgeInsets.all(FxSpace.x3),
               decoration: BoxDecoration(

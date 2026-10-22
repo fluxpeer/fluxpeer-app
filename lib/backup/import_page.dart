@@ -36,7 +36,7 @@ class _ImportPageState extends State<ImportPage> {
       final n = Get.find<AppController>().importBackup(raw);
       if (!mounted) return;
       Navigator.pop(context);
-      _toast('Imported $n network(s)');
+      _toast('Imported $n network(s). Rejoin before connecting.');
     } catch (_) {
       if (mounted) _toast("That backup couldn't be read");
     } finally {

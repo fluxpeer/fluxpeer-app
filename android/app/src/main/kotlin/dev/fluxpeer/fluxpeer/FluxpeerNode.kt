@@ -54,6 +54,11 @@ object FluxpeerNode {
         (vpn as? FluxpeerVpnService)?.onRoutes(generation, json)
     }
 
+    @JvmStatic
+    fun onReady(generation: Long) {
+        (vpn as? FluxpeerVpnService)?.onReady(generation)
+    }
+
     /**
      * Engine → app upcall (JNI): the engine exited on its own (fatal error / lost
      * its last path), NOT via [stopNode]. The service tears down so we don't leave

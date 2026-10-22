@@ -96,7 +96,7 @@ const _en = {
   'perm.cardBody': 'Enable these so the tunnel survives screen-off and background.',
   'perm.cardCta': 'Set up',
   'perm.later': 'Later',
-  'me.importHint': 'Paste a backup (JSON) exported from another device.',
+  'me.importHint': 'Restore display settings only. You must rejoin each network before connecting.',
   'settings.identity': 'Network identity',
 };
 
